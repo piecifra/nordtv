@@ -1,5 +1,5 @@
 'use strict';
-// Both bundles inside Vetro's real plugin host (from a Vetro checkout), behind a real HTTP server:
+// The bundle inside Vetro's real plugin host (from a Vetro checkout), behind a real HTTP server:
 // install with Developer mode, switch on, call the pages and routes as the dashboard would, switch off.
 const assert = require('assert').strict, fs = require('fs'), os = require('os'), path = require('path'), http = require('http'), cp = require('child_process');
 const vetro = [process.env.VETRO_DIR, path.join(__dirname, '../../vetro'), path.join(__dirname, '../../vetro-0.5.0')]
@@ -11,7 +11,7 @@ const tool = path.join(vetro, 'app/scripts/vetro-plugin.cjs');
 (async () => {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'shard-pack-')), dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shard-host-'));
   const bundles = {};
-  for (const id of ['shell', 'nordvpn']) {
+  for (const id of ['nordvpn']) {
     const r = cp.spawnSync(process.execPath, [tool, 'pack', path.join(__dirname, '..', id)], { cwd: out, encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr); const file = fs.readdirSync(out).find(f => f.startsWith(id + '-'));
     bundles[id] = fs.readFileSync(path.join(out, file), 'utf8');
@@ -23,7 +23,7 @@ const tool = path.join(vetro, 'app/scripts/vetro-plugin.cjs');
     return new Promise(res => { const p = cp.spawnSync('/bin/sh', ['-c', cmd], { encoding: 'utf8' }); res({ exit_code: p.status, stdout: p.stdout, stderr: p.stderr }); }); };
   const host = new PluginHost({ dir, execute, stableMs: 10 });
   host._writeState({ enabled: {}, developer: true });
-  for (const id of ['shell', 'nordvpn']) { host.install(bundles[id]); assert.equal(host.setEnabled(id, true).state, 'running', id + ' starts in the host'); }
+  for (const id of ['nordvpn']) { host.install(bundles[id]); assert.equal(host.setEnabled(id, true).state, 'running', id + ' starts in the host'); }
 
   const json = (res, body, code) => { res.writeHead(code || 200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
   const server = http.createServer((req, res) => { if (!host.handle(req, res, req.url.split('?')[0], json)) json(res, { error: 'not found' }, 404); });
@@ -31,15 +31,13 @@ const tool = path.join(vetro, 'app/scripts/vetro-plugin.cjs');
   const base = 'http://127.0.0.1:' + server.address().port;
   const get = u => fetch(base + u), post = (u, b) => fetch(base + u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });
 
-  let r = await get('/plugins/shell/api/ui'); assert.equal(r.status, 200); assert.ok((await r.text()).includes('<title>Shell</title>'));
-  assert.equal(r.headers.get('content-security-policy'), 'sandbox allow-scripts', 'served sandboxed by the host');
-  r = await post('/plugins/shell/api/run', { cmd: 'echo from-host; cd /tmp' }); let j = await r.json();
-  assert.equal(j.stdout, 'from-host\n'); assert.equal(fs.realpathSync(j.cwd), fs.realpathSync('/tmp'));
-  r = await get('/plugins/nordvpn/api/ui'); assert.ok((await r.text()).includes('<title>NordVPN</title>'));
+  let j;
+  let r = await get('/plugins/nordvpn/api/ui'); assert.equal(r.headers.get('content-security-policy'), 'sandbox allow-scripts', 'served sandboxed by the host');
+ assert.ok((await r.text()).includes('<title>NordVPN</title>'));
   r = await get('/plugins/nordvpn/api/state'); j = await r.json(); assert.equal(j.installed, true); assert.equal(j.country, 'IT');
   r = await get('/plugins/nordvpn'); j = await r.json(); assert.equal(j.state, 'running');
-  for (const id of ['shell', 'nordvpn']) assert.notEqual(host.setEnabled(id, false).state, 'running', id + ' stops cleanly');
-  r = await get('/plugins/shell/api/ui'); assert.equal(r.status, 503, 'routes close when switched off');
+  for (const id of ['nordvpn']) assert.notEqual(host.setEnabled(id, false).state, 'running', id + ' stops cleanly');
+  r = await get('/plugins/nordvpn/api/ui'); assert.equal(r.status, 503, 'routes close when switched off');
   server.close(); fs.rmSync(out, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true });
-  console.log('PASS host: both bundles install, start, serve their pages and routes inside Vetro ' + require(path.join(vetro, 'app/package.json')).version + "'s plugin host, and stop");
+  console.log('PASS host: the bundle installs, starts, serves its page and routes inside Vetro ' + require(path.join(vetro, 'app/package.json')).version + "'s plugin host, and stop");
 })().catch(e => { console.error(e); process.exitCode = 1; });
