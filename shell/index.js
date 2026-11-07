@@ -59,6 +59,13 @@ function readJson(req, cb) {
     req.on('error', function (e) { if (!done) { done = true; cb(e); } });
 }
 
+// The page ships next to this file. ctx.dir is the plugin's folder on the TV, but a test harness may give an empty
+// one: read it from where the code is, fall back to ctx.dir, and never fail start() over it.
+function loadPage(ctx) {
+    var places = [path.join(__dirname, 'ui.html'), path.join(ctx.dir || '', 'ui.html')];
+    for (var i = 0; i < places.length; i++) { try { return fs.readFileSync(places[i], 'utf8'); } catch (e) { /* next */ } }
+    return '<!doctype html><meta charset="utf-8"><p>Page file missing: reinstall this Shard.</p>';
+}
 module.exports = function (ctx) {
     var page = null, busy = false, runs = 0, lastCwd = '/';
     function history() { var h = ctx.config.get().history; return Array.isArray(h) ? h.filter(function (x) { return typeof x === 'string'; }) : []; }
@@ -69,7 +76,7 @@ module.exports = function (ctx) {
         try { ctx.config.set(c); } catch (e) { /* history is a convenience */ }
     }
     return {
-        start: function () { page = fs.readFileSync(path.join(ctx.dir, 'ui.html'), 'utf8'); lastCwd = validCwd(ctx.config.get().cwd) ? ctx.config.get().cwd : '/'; },
+        start: function () { page = loadPage(ctx); lastCwd = validCwd(ctx.config.get().cwd) ? ctx.config.get().cwd : '/'; },
         stop: function () { page = null; },
         status: function () { return { commands: runs, cwd: lastCwd, running: busy }; },
         route: function (req, res, sub) {

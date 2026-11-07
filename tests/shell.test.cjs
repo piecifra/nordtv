@@ -45,6 +45,10 @@ function call(inst, method, sub, body) {
   const slow = shell(Object.assign({}, ctx, { execute: () => new Promise(r => setTimeout(() => r({ exit_code: 0, stdout: '' }), 50)) })); slow.start();
   const first = call(slow, 'POST', 'run', { cmd: 'sleep 1' }); await new Promise(r => setTimeout(r, 10));
   res = await call(slow, 'POST', 'run', { cmd: 'ls' }); assert.equal(res.code, 409, 'one command at a time'); await first;
+  // As the catalog's smoke harness does: ctx.dir is an empty folder. The page must still be served.
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'shard-shell-empty-'));
+  const bare = shell(Object.assign({}, ctx, { dir: empty })); bare.start();
+  res = await call(bare, 'GET', 'ui'); assert.ok(/<title>Shell<\/title>/.test(res.body), 'page found next to index.js'); bare.stop(); fs.rmSync(empty, { recursive: true, force: true });
   inst.stop(); fs.rmSync(tmp, { recursive: true, force: true }); fs.rmSync(pdir, { recursive: true, force: true });
   console.log('PASS shell plugin: validation, base64 transport, cwd with nonce marker, closed stdin, routes, history, one at a time');
 })().catch(e => { console.error(e); process.exitCode = 1; });

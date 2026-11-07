@@ -160,6 +160,13 @@ function readJson(req, cb) {
     req.on('error', function (e) { if (!done) { done = true; cb(e); } });
 }
 
+// The page ships next to this file. ctx.dir is the plugin's folder on the TV, but a test harness may give an empty
+// one: read it from where the code is, fall back to ctx.dir, and never fail start() over it.
+function loadPage(ctx) {
+    var places = [path.join(__dirname, 'ui.html'), path.join(ctx.dir || '', 'ui.html')];
+    for (var i = 0; i < places.length; i++) { try { return fs.readFileSync(places[i], 'utf8'); } catch (e) { /* next */ } }
+    return '<!doctype html><meta charset="utf-8"><p>Page file missing: reinstall this Shard.</p>';
+}
 module.exports = function (ctx) {
     var vpn = new Vpn(ctx.execute), page = null, timer = null, first = null, stopped = true;
     function tick() { if (stopped) return; vpn.supervise().catch(function () { /* recorded in lastAuto; the root agent may not be up yet */ }); }
@@ -167,7 +174,7 @@ module.exports = function (ctx) {
     return {
         start: function () {
             stopped = false;
-            page = fs.readFileSync(path.join(ctx.dir, 'ui.html'), 'utf8');
+            page = loadPage(ctx);
             // Install (or update) the binary first, then begin supervising; neither may throw out of start().
             first = setTimeout(function () { vpn.install().catch(function () {}).then(tick); }, FIRST_TICK_MS);
             timer = setInterval(tick, TICK_MS);
