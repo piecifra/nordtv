@@ -16,7 +16,8 @@ after a restart or a drop. It adds a **VPN** tab inside Vetro Shards.
    token), choose a country, switch the VPN on. "Keep connected" brings it back after a restart.
 
 It is not in the official Shard catalog: the catalog accepts text only, and the VPN needs a native program. The
-question of how it could fit is open with the catalog's maintainer.
+question of how it could fit is open with the catalog's maintainer
+([vetro-plugins#6](https://github.com/andrearicci93/vetro-plugins/issues/6)).
 
 ## How it works
 
