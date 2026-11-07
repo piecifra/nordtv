@@ -7,5 +7,5 @@
   "main": "index.js",
   "ui": { "label": "Shell" },
   "description": "A root shell on the TV from the dashboard, one command at a time; cd is remembered.",
-  "author": "Pierfrancesco Cifra"
+  "author": "piecifra"
 }

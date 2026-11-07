@@ -7,6 +7,8 @@
 var crypto = require('crypto'), fs = require('fs'), path = require('path');
 var DEFAULT_TIMEOUT = 30000, MAX_TIMEOUT = 120000, MAX_COMMAND = 16384, MAX_OUTPUT = 262144, MAX_HISTORY = 200, MAX_BODY = 32768;
 
+// Node 4.4 has a Buffer.from inherited from Uint8Array that does not take a string; Node 5.10+ has the real one.
+function bytes(s) { return Buffer.from && Buffer.from !== Uint8Array.from ? Buffer.from(s) : new Buffer(s); }
 function quote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
 function validCwd(cwd) { return typeof cwd === 'string' && cwd.charAt(0) === '/' && cwd.length <= 4096 && !/[\0\n\r]/.test(cwd); }
 
@@ -21,7 +23,7 @@ function build(p) {
     var shown = cwd.replace(/[^\x20-\x7e]/g, '?').replace(/["$`\\]/g, '?');
     var script = 'cd ' + quote(cwd) + ' 2>/dev/null || { echo "cd: ' + shown + ': not found, using /" >&2; cd /; }\n' +
         cmd + '\n__vetro_status=$?\nprintf "\\n' + marker + '%s\\n" "$(pwd)"\nexit $__vetro_status\n';
-    var b64 = Buffer.from(script).toString('base64');
+    var b64 = bytes(script).toString('base64');
     var command = '__vetro_script="$(echo ' + b64 + ' | base64 -d)"; if command -v bash >/dev/null 2>&1; then exec bash -c "$__vetro_script" </dev/null; else exec sh -c "$__vetro_script" </dev/null; fi';
     return { command: command, nonce: nonce, timeout: Math.round(timeout), cwd: cwd };
 }

@@ -20,6 +20,8 @@ var STAGE = 'chmod 755 ' + DIR + ' 2>/dev/null; chmod go-w ' + DIR + '/* 2>/dev/
     'a=$(md5sum < ' + DIR + '/nordtv); b=$(md5sum < ' + RUN + ' 2>/dev/null)\n' +
     'if [ "$a" != "$b" ]; then cp ' + DIR + '/nordtv ' + RUN + '.new && chmod 755 ' + RUN + '.new && mv -f ' + RUN + '.new ' + RUN + '; fi\ncd /\n';
 
+// Node 4.4 has a Buffer.from inherited from Uint8Array that does not take a string; Node 5.10+ has the real one.
+function bytes(s) { return Buffer.from && Buffer.from !== Uint8Array.from ? Buffer.from(s) : new Buffer(s); }
 function installScript(bin) {
     if (!bin || !URL_RE.test(bin.url || '') || !SHA.test(bin.sha256 || '')) return null;
     var tmp = DIR + '/nordtv.gz.part';
@@ -31,7 +33,7 @@ function installScript(bin) {
         'gunzip -c ' + tmp + ' > ' + DIR + '/nordtv.new && chmod 755 ' + DIR + '/nordtv.new && mv -f ' + DIR + '/nordtv.new ' + DIR + '/nordtv && echo ' + bin.sha256 + ' > ' + DIR + '/.source && rm -f ' + tmp + ' && echo __INSTALLED__\n';
 }
 
-function wrap(s) { return 'echo ' + Buffer.from(s).toString('base64') + ' | base64 -d | sh'; }
+function wrap(s) { return 'echo ' + bytes(s).toString('base64') + ' | base64 -d | sh'; }
 function lastJson(out) {
     var lines = String(out || '').trim().split('\n');
     for (var i = lines.length - 1; i >= 0; i--) { var l = lines[i].trim(); if (l.charAt(0) === '{') { try { return JSON.parse(l); } catch (e) { /* not JSON */ } } }
@@ -127,7 +129,7 @@ Vpn.prototype.configure = function (opts) {
 Vpn.prototype.setToken = function (token) {
     var self = this;
     if (typeof token !== 'string' || !TOKEN.test(token.trim())) return Promise.reject(new Error('Invalid token format'));
-    var b64 = Buffer.from(token.trim() + '\n').toString('base64');
+    var b64 = bytes(token.trim() + '\n').toString('base64');
     return lock(this, function () {
         return self.execute(wrap(STAGE + 'umask 077\nmkdir -p ' + DIR + '\necho ' + b64 + ' | base64 -d > ' + DIR + '/token.new && mv -f ' + DIR + '/token.new ' + DIR + '/token\n' + RUN + ' verify'), 30000).then(function (r) {
             if (/__NOBIN__/.test(r.stdout || '')) throw new Error('The VPN program is not installed');

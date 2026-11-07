@@ -7,5 +7,5 @@
   "main": "index.js",
   "ui": { "label": "VPN" },
   "description": "NordVPN (NordLynx/WireGuard) on the TV itself: on/off, country, kill switch, reconnect after restarts.",
-  "author": "Pierfrancesco Cifra"
+  "author": "piecifra"
 }
