@@ -12,14 +12,23 @@ install only code you have read.
 
 ## Install
 
-1. Vetro 0.5+: **Vetro Shards → Install from a file or develop a plugin → Developer mode** on.
-2. Pick `dist/shell-1.0.0.vplugin` and `dist/nordvpn-1.0.0.vplugin`, then switch them on.
+- **Shell** is submitted to the official Shard catalog
+  ([vetro-plugins#4](https://github.com/andrearicci93/vetro-plugins/pull/4)). Once it is merged, install it from
+  **Vetro Shards → Load plugin catalog**. Until then, use the file below.
+- **NordVPN** is not in the catalog: it needs a native program, which the catalog does not accept
+  (see [the question there](https://github.com/andrearicci93/vetro-plugins/issues)). Install it from a file.
+
+From a file (Vetro 0.5+):
+
+1. Download `nordvpn-1.0.0.vplugin` (or `shell-1.0.0.vplugin`) from the
+   [latest release](https://github.com/piecifra/vetro-shards/releases/latest) and check it against `SHA256SUMS`.
+2. **Vetro Shards → Install from a file or develop a plugin → Developer mode** on, pick the file, switch it on.
 3. NordVPN: paste an access token (Nord Account → NordVPN → Set up NordVPN manually), choose a country, switch on.
 
-The VPN program (`nordtv/`, Go, built by `nordtv/build.sh` into `dist/nordtv.gz`) is too large for a plugin
-bundle (512 KB, text only). The plugin uses `/opt/nordtv/nordtv` when it is there. To let it download the binary,
-publish `dist/nordtv.gz` (https) and run `./nordtv/build.sh --pin <url>`: the URL and SHA-256 go into
-`nordvpn/index.js`, and a download with another checksum is refused.
+The VPN program (`nordtv/`, Go, about 2.8 MB) does not fit in a plugin bundle (512 KB, text only). The plugin uses
+`/opt/nordtv/nordtv` when it is there; otherwise it downloads `nordtv.gz` from this repository's v1.0.0 release and
+installs it only if its SHA-256 is the one pinned in `nordvpn/index.js`. The build is reproducible: run
+`./nordtv/build.sh` with the Go version in `nordtv/go.mod` and compare the checksum yourself.
 
 ## Develop
 

@@ -9,7 +9,7 @@
 // State lives in the binary's own files (/opt/nordtv/config, token, log); the same commands work from a shell.
 // The token is written through base64 and never read back. Plain ES5: older TVs run Node 4.4.
 var fs = require('fs'), path = require('path');
-var BINARY = { url: '', sha256: '' };   // filled in by nordtv/build.sh --pin (see README)
+var BINARY = { url: 'https://github.com/piecifra/vetro-shards/releases/download/v1.0.0/nordtv.gz', sha256: 'f16a6e80b90641361394904c543877bd931ba48992911c5d69d5c7f7a92c9d4e' };   // written by nordtv/build.sh --pin
 var DIR = '/opt/nordtv', RUN = '/dev/shm/nordtv';
 var COUNTRY = /^[A-Z]{2}$/, TOKEN = /^[A-Za-z0-9_-]{16,256}$/, SHA = /^[0-9a-f]{64}$/, URL_RE = /^https:\/\/[A-Za-z0-9.\/_~%+-]+$/;
 var RETRY_MS = 120000, TICK_MS = 60000, FIRST_TICK_MS = 15000, MAX_BODY = 8192;
