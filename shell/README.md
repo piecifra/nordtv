@@ -1,7 +1,11 @@
 # Shell
 
-A root shell on the TV, on a page in the Vetro dashboard: type a command, see its output. One command at a time;
-`cd` is remembered between commands, history is kept, and each command has a time limit you choose (10–120 s).
+A root shell on the TV, on a page in the Vetro dashboard, laid out like a terminal: the prompt sits under the output
+and each command stays in the scrollback with what it printed. One command at a time; `cd` is remembered between
+commands, history is kept, and each command has a time limit you choose (10–120 s).
+
+Keys: Enter runs · ↑ ↓ history · Ctrl+C drops the line you are typing · Ctrl+U clears it · Ctrl+L or `clear`
+clears the screen. Ctrl+C does not stop a command that is already running: the time limit does.
 
 It is the dashboard counterpart of Vetro's `POST /exec`, with bounded input and a working directory. Only paired
 devices can open it, like the rest of Vetro.
@@ -14,7 +18,7 @@ devices can open it, like the rest of Vetro.
 
 | Command | Why |
 | --- | --- |
-| **the command you type**, exactly as typed | that is what a shell does; nothing runs unless you press Enter or **Run** |
+| **the command you type**, exactly as typed | that is what a shell does; nothing runs unless you press Enter |
 | a wrapper around it: `cd '<cwd>'`, then your command, then `printf` of the directory it ended in | to carry the working directory over to the next command |
 
 How a command is run, so you can check it in `index.js` (`build()`):
