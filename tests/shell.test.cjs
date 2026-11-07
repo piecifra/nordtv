@@ -2,7 +2,7 @@
 const assert = require('assert').strict, fs = require('fs'), os = require('os'), path = require('path'), spawnSync = require('child_process').spawnSync;
 const shell = require('../shell/index.js');
 
-for (const bad of [{}, { cmd: '' }, { cmd: '   ' }, { cmd: 1 }, { cmd: 'x'.repeat(16385) }, { cmd: 'ls', cwd: 'relative' }, { cmd: 'ls', cwd: '/a\nb' }, { cmd: 'ls', timeout: 500 }, { cmd: 'ls', timeout: 120001 }, { cmd: 'ls', timeout: '30' }])
+for (const bad of [{}, { cmd: '' }, { cmd: '   ' }, { cmd: 1 }, { cmd: 'x'.repeat(16385) }, { cmd: 'ls', cwd: 'relative' }, { cmd: 'ls', cwd: '/a\nb' }, { cmd: 'ls', timeout: 500 }, { cmd: 'ls', timeout: 60001 }, { cmd: 'ls', timeout: '30' }])
   assert.throws(() => shell.build(bad), JSON.stringify(bad).slice(0, 40));
 const job = shell.build({ cmd: 'echo hi' });
 assert.equal(job.cwd, '/'); assert.equal(job.timeout, 30000); assert.ok(/^[0-9a-f]{16}$/.test(job.nonce));
@@ -39,9 +39,25 @@ function call(inst, method, sub, body) {
   res = await call(inst, 'POST', 'run', { cmd: 'cd ' + tmp + ' && echo hi' }); let j = JSON.parse(res.body);
   assert.deepEqual([res.code, j.stdout, j.cwd], [200, 'hi\n', tmp]);
   res = await call(inst, 'GET', 'state'); j = JSON.parse(res.body); assert.deepEqual([j.cwd, j.history], [tmp, ['cd ' + tmp + ' && echo hi']], 'history and cwd kept in config.json');
+  // History: cleared from the page (POST), switched off (deletes what was saved, saves nothing more), back on.
+  res = await call(inst, 'POST', 'history/clear', {}); j = JSON.parse(res.body); assert.deepEqual([res.code, j.history], [200, []]);
+  assert.deepEqual(saved.history, [], 'cleared in config.json');
+  await call(inst, 'POST', 'run', { cmd: 'echo secret-a' });
+  res = await call(inst, 'POST', 'settings', { saveHistory: false }); j = JSON.parse(res.body);
+  assert.deepEqual([j.saveHistory, j.history, saved.history], [false, [], []], 'off deletes the saved history');
+  await call(inst, 'POST', 'run', { cmd: 'echo secret-b' });
+  assert.ok(!JSON.stringify(saved).includes('secret'), 'nothing is written while history is off');
+  res = await call(inst, 'POST', 'settings', { saveHistory: 'no' }); assert.equal(res.code, 400);
+  await call(inst, 'POST', 'settings', { saveHistory: true }); await call(inst, 'POST', 'run', { cmd: 'echo kept' });
+  assert.deepEqual(saved.history, ['echo kept']);
+  // A config that cannot be read or written never leaves a request without an answer.
+  const broken = shell(Object.assign({}, ctx, { config: { get: () => { throw new Error('read'); }, set: () => { throw new Error('write'); } } })); broken.start();
+  res = await call(broken, 'POST', 'run', { cmd: 'echo still' }); j = JSON.parse(res.body); assert.deepEqual([res.code, j.stdout], [200, 'still\n']);
+  res = await call(broken, 'GET', 'state'); assert.equal(res.code, 200);
+  res = await call(broken, 'POST', 'history/clear', {}); assert.equal(res.code, 500);
   res = await call(inst, 'POST', 'run', { cmd: '' }); assert.equal(res.code, 400);
   res = await call(inst, 'POST', 'run', { cmd: 'ls', cwd: 'x' }); assert.equal(res.code, 400);
-  assert.deepEqual(inst.status(), { commands: 1, cwd: tmp, running: false });
+  assert.deepEqual(inst.status(), { commands: 4, cwd: '/', running: false });
   const slow = shell(Object.assign({}, ctx, { execute: () => new Promise(r => setTimeout(() => r({ exit_code: 0, stdout: '' }), 50)) })); slow.start();
   const first = call(slow, 'POST', 'run', { cmd: 'sleep 1' }); await new Promise(r => setTimeout(r, 10));
   res = await call(slow, 'POST', 'run', { cmd: 'ls' }); assert.equal(res.code, 409, 'one command at a time'); await first;

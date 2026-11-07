@@ -20,8 +20,10 @@ button,select{height:30px;padding:0 10px;border:1px solid var(--border);border-r
 </style></head><body>
 <div class="bar">
  <span class="info">Root shell on the TV, one command at a time (bash if the TV has it). <code>cd</code> is remembered; variables are not. No <code>vi</code>/<code>top</code>/<code>less</code>: use <code>top -b -n 1</code>. A command here can damage the TV: read it before you run it.</span>
- <label>Time limit <select id="limit"><option value="10">10 s</option><option value="30" selected>30 s</option><option value="60">60 s</option><option value="120">120 s</option></select></label>
- <button id="clear" type="button" title="Ctrl+L">Clear</button>
+ <label>Time limit <select id="limit"><option value="10">10 s</option><option value="30" selected>30 s</option><option value="60">60 s</option></select></label>
+ <label title="Commands can contain secrets typed on the command line"><input id="save" type="checkbox" checked> Save history</label>
+ <button id="forget" type="button">Clear history</button>
+ <button id="clear" type="button" title="Ctrl+L">Clear screen</button>
 </div>
 <div id="term" role="log" aria-live="polite" aria-label="Shell"><div id="out"></div><div id="line"><span class="p" id="prompt">root@tv:/# </span><input id="cmd" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Command" autofocus></div></div>
 <script>
@@ -32,9 +34,15 @@ function prompt(){$('prompt').textContent=ps1()}
 function bottom(){var t=$('term');t.scrollTop=t.scrollHeight}
 function print(t,c){if(!t)return;var o=$('out'),s=document.createElement('span');if(c)s.className=c;s.textContent=t;o.appendChild(s);while(o.childNodes.length>MAXNODES)o.removeChild(o.firstChild);bottom()}
 function nl(t){return t&&t.charAt(t.length-1)!=='\n'?t+'\n':t}
-function api(u,b){return fetch(u,b===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(r){return r.json().then(function(d){if(!r.ok&&d.stdout===undefined&&d.error)throw new Error(d.error);return d})})}
+// A request that gets no readable answer (the browser says only "Load failed" or "Failed to fetch") almost always
+// means this page's session ended: it does when the Shard is switched off or updated, and after 8 hours.
+var GONE='no answer from the Shard. Its page session ends when the Shard is switched off or updated, and after 8 hours: open the Shell tab again.';
+function api(u,b){return fetch(u,b===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(r){return r.json().catch(function(){throw new Error(GONE)}).then(function(d){if(!r.ok&&d.stdout===undefined)throw new Error(d.error||GONE);return d})},function(){throw new Error(GONE)})}
 function clear(){$('out').textContent='';$('cmd').focus()}
-api('state').then(function(d){cwd=d.cwd||'/';hist=d.history||[];pos=hist.length;prompt()}).catch(function(){prompt()});
+function settings(d){if(typeof d.saveHistory==='boolean')$('save').checked=d.saveHistory}
+api('state').then(function(d){cwd=d.cwd||'/';hist=d.history||[];pos=hist.length;settings(d);prompt()}).catch(function(e){print('vetro: '+e.message+'\n','err');prompt()});
+$('save').onchange=function(){var on=this.checked;api('settings',{saveHistory:on}).then(function(d){settings(d);if(!on){hist=[];pos=0}print((on?'[history is saved on the TV]':'[history is not saved; saved history deleted]')+'\n','note')}).catch(function(e){$('save').checked=!on;print('vetro: '+e.message+'\n','err')}).then(function(){$('cmd').focus()})};
+$('forget').onclick=function(){api('history/clear',{}).then(function(){hist=[];pos=0;draft='';print('[history cleared]\n','note')}).catch(function(e){print('vetro: '+e.message+'\n','err')}).then(function(){$('cmd').focus()})};
 function run(cmd){
  // the prompt line becomes scrollback, as in a terminal
  print(ps1(),'p');print(cmd+'\n');

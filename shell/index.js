@@ -5,7 +5,8 @@
 // fake it). bash is used when the TV has it, sh otherwise. stdin is /dev/null so a command waiting for input ends
 // instead of holding Vetro's command queue until the time limit. Plain ES5: older TVs run Node 4.4.
 var crypto = require('crypto'), fs = require('fs'), path = require('path');
-var DEFAULT_TIMEOUT = 30000, MAX_TIMEOUT = 120000, MAX_COMMAND = 16384, MAX_OUTPUT = 262144, MAX_HISTORY = 200, MAX_BODY = 32768;
+// Every Vetro TV command shares one queue: a long command makes everything else wait, so the cap is 60 s.
+var DEFAULT_TIMEOUT = 30000, MAX_TIMEOUT = 60000, MAX_COMMAND = 16384, MAX_OUTPUT = 262144, MAX_HISTORY = 200, MAX_BODY = 32768;
 
 // Node 4.4 has a Buffer.from inherited from Uint8Array that does not take a string; Node 5.10+ has the real one.
 function bytes(s) { return Buffer.from && Buffer.from !== Uint8Array.from ? Buffer.from(s) : new Buffer(s); }
@@ -18,7 +19,7 @@ function build(p) {
     if (typeof cmd !== 'string' || !cmd.trim()) throw new Error('Missing command');
     if (cmd.length > MAX_COMMAND) throw new Error('Command too long');
     if (!validCwd(cwd)) throw new Error('Invalid working directory');
-    if (typeof timeout !== 'number' || !(timeout >= 1000) || timeout > MAX_TIMEOUT) throw new Error('Time limit must be 1–120 seconds');
+    if (typeof timeout !== 'number' || !(timeout >= 1000) || timeout > MAX_TIMEOUT) throw new Error('Time limit must be 1–60 seconds');
     var nonce = crypto.randomBytes(8).toString('hex'), marker = '__VETRO_CWD_' + nonce + '__';
     var shown = cwd.replace(/[^\x20-\x7e]/g, '?').replace(/["$`\\]/g, '?');
     var script = 'cd ' + quote(cwd) + ' 2>/dev/null || { echo "cd: ' + shown + ': not found, using /" >&2; cd /; }\n' +
@@ -68,15 +69,24 @@ function loadPage(ctx) {
 }
 module.exports = function (ctx) {
     var page = null, busy = false, runs = 0, lastCwd = '/';
-    function history() { var h = ctx.config.get().history; return Array.isArray(h) ? h.filter(function (x) { return typeof x === 'string'; }) : []; }
+    // config.json: { saveHistory: boolean (default true), history: [commands], cwd }. Commands can hold secrets typed
+    // on the command line, so history can be cleared from the page and switched off; off also deletes what was saved.
+    // A config read or write that fails never breaks a request: history is a convenience.
+    function load() { try { var c = ctx.config.get(); return c && typeof c === 'object' && !Array.isArray(c) ? c : {}; } catch (e) { return {}; } }
+    function save(c) { try { ctx.config.set(c); return true; } catch (e) { return false; } }
+    function saving(c) { return (c || load()).saveHistory !== false; }
+    function history(c) { c = c || load(); var h = c.history; return saving(c) && Array.isArray(h) ? h.filter(function (x) { return typeof x === 'string'; }) : []; }
     function remember(cmd, cwd) {
-        var c = ctx.config.get(), h = history();
-        if (h[h.length - 1] !== cmd) h.push(cmd);
-        c.history = h.slice(-MAX_HISTORY); c.cwd = cwd;
-        try { ctx.config.set(c); } catch (e) { /* history is a convenience */ }
+        var c = load(), h = history(c);
+        if (saving(c) && h[h.length - 1] !== cmd) h.push(cmd);
+        c.history = saving(c) ? h.slice(-MAX_HISTORY) : [];
+        c.cwd = cwd;
+        save(c);
     }
+    function clearHistory() { var c = load(); c.history = []; return save(c); }
+    function state() { var c = load(); return { cwd: lastCwd, history: history(c), saveHistory: saving(c), busy: busy }; }
     return {
-        start: function () { page = loadPage(ctx); lastCwd = validCwd(ctx.config.get().cwd) ? ctx.config.get().cwd : '/'; },
+        start: function () { var c = load(); page = loadPage(ctx); lastCwd = validCwd(c.cwd) ? c.cwd : '/'; },
         stop: function () { page = null; },
         status: function () { return { commands: runs, cwd: lastCwd, running: busy }; },
         route: function (req, res, sub) {
@@ -85,8 +95,22 @@ module.exports = function (ctx) {
                 res.end(page || '');
                 return true;
             }
-            if (sub === 'state' && req.method === 'GET') { json(res, { cwd: lastCwd, history: history(), busy: busy }); return true; }
-            if (sub === 'history' && req.method === 'DELETE') { var c = ctx.config.get(); c.history = []; ctx.config.set(c); json(res, { ok: true }); return true; }
+            if (sub === 'state' && req.method === 'GET') { json(res, state()); return true; }
+            // POST: the sandboxed page may only send GET and POST (the host's CORS preflight allows nothing else).
+            if (sub === 'history/clear' && (req.method === 'POST' || req.method === 'DELETE')) {
+                if (clearHistory()) json(res, state()); else json(res, { ok: false, error: 'History could not be cleared' }, 500);
+                return true;
+            }
+            if (sub === 'settings' && req.method === 'POST') {
+                readJson(req, function (err, p) {
+                    if (err) return json(res, { ok: false, error: err.message }, 400);
+                    if (typeof p.saveHistory !== 'boolean') return json(res, { ok: false, error: 'saveHistory must be true or false' }, 400);
+                    var c = load(); c.saveHistory = p.saveHistory; if (!p.saveHistory) c.history = [];
+                    if (!save(c)) return json(res, { ok: false, error: 'Setting could not be saved' }, 500);
+                    json(res, state());
+                });
+                return true;
+            }
             if (sub === 'run' && req.method === 'POST') {
                 readJson(req, function (err, p) {
                     if (err) return json(res, { ok: false, error: err.message }, 400);
@@ -94,7 +118,9 @@ module.exports = function (ctx) {
                     try { build(p); } catch (e) { return json(res, { ok: false, error: e.message }, 400); }
                     busy = true;
                     run(ctx.execute, p).then(function (d) {
-                        runs++; lastCwd = d.cwd; remember(p.cmd, d.cwd); json(res, d);
+                        runs++; lastCwd = d.cwd;
+                        try { remember(p.cmd, d.cwd); } catch (e) { /* the command ran: answer anyway */ }
+                        json(res, d);
                     }, function (e) {
                         json(res, { ok: false, error: String(e && e.message || e) }, 503);
                     }).then(function () { busy = false; }, function () { busy = false; });
