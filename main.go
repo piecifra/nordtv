@@ -64,6 +64,7 @@ func main() {
 	if len(os.Args) < 2 {
 		usage()
 	}
+	secureState()
 	switch os.Args[1] {
 	case "up":
 		cmdUp(os.Args[2:])

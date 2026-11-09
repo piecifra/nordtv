@@ -34,8 +34,8 @@ func cfgSet(k, v string) {
 			fmt.Fprintf(&sb, "%s=%s\n", key, val)
 		}
 	}
-	os.MkdirAll(stateDir, 0755)
-	os.WriteFile(cfgFile, []byte(sb.String()), 0644)
+	os.MkdirAll(stateDir, 0700)
+	os.WriteFile(cfgFile, []byte(sb.String()), 0600)
 }
 
 func running() bool {
@@ -69,7 +69,7 @@ func cmdStart(args []string) {
 		upArgs = append(upArgs, "-killswitch")
 	}
 	self, _ := os.Executable()
-	logf, err := os.Create(stateDir + "/log")
+	logf, err := os.OpenFile(stateDir+"/log", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -110,7 +110,7 @@ func cmdSet(a []string) {
 		}
 		cfgSet(strings.ToUpper(a[0]), v)
 	case "token":
-		os.MkdirAll(stateDir, 0755)
+		os.MkdirAll(stateDir, 0700)
 		os.WriteFile(stateDir+"/token", []byte(a[1]+"\n"), 0600)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown setting", a[0])
@@ -223,4 +223,29 @@ func cmdVerify() {
 		}
 	}
 	json.NewEncoder(os.Stdout).Encode(out)
+}
+
+// secureState keeps /opt/nordtv root-only: root runs the binary from here and the token is a credential.
+// Folder 0700, everything in it 0600, the binary 0700. Files created later already get these modes.
+func secureState() {
+	if os.Geteuid() != 0 {
+		return
+	}
+	if fi, err := os.Stat(stateDir); err != nil || !fi.IsDir() {
+		return
+	}
+	os.Chmod(stateDir, 0700)
+	entries, _ := os.ReadDir(stateDir)
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		p := stateDir + "/" + e.Name()
+		os.Lchown(p, 0, 0)
+		if e.Name() == "nordtv" || strings.HasSuffix(e.Name(), ".new") {
+			os.Chmod(p, 0700)
+		} else {
+			os.Chmod(p, 0600)
+		}
+	}
 }
