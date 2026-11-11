@@ -1,15 +1,15 @@
-// nordtv: self-contained NordLynx (WireGuard) client for Tizen TVs (or any Linux).
+// nordtv: self-contained WireGuard client for Tizen TVs (or any Linux): NordVPN (NordLynx, through its API) or
+// any provider or server from a wg-quick .conf (IPv4 only).
 //
-//   nordtv up   [-token T | -conf wg.conf] [-country IT] [-server it123.nordvpn.com] [-killswitch]
-//   nordtv down
-//   nordtv status
+//	nordtv up   [-token T | -conf wg.conf] [-country IT] [-server it123.nordvpn.com] [-killswitch]
+//	nordtv down
+//	nordtv status
 //
 // Runs wireguard-go in userspace on /dev/net/tun, then sets up policy routing
 // (wg-quick style), DNS redirection and an optional kill switch via ip/iptables.
 package main
 
 import (
-	"bufio"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -48,6 +48,9 @@ const (
 
 var nordDNS = []string{"103.86.96.100", "103.86.99.100"}
 
+// fallbackDNS is used, through the tunnel, by a full-tunnel .conf without a DNS line (Quad9).
+var fallbackDNS = []string{"9.9.9.9"}
+
 type wgConf struct {
 	PrivateKey string
 	Address    string // CIDR
@@ -57,6 +60,18 @@ type wgConf struct {
 	Endpoint   string // host:port
 	Keepalive  int
 	Label      string
+	PSK        string   // PresharedKey, optional
+	Allowed    []string // IPv4 AllowedIPs, normalised; {"0.0.0.0/0"} is the full tunnel
+}
+
+// full is true when every IPv4 destination goes through the tunnel.
+func (c *wgConf) full() bool {
+	for _, a := range c.Allowed {
+		if a == "0.0.0.0/0" {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -91,6 +106,8 @@ func main() {
 		cmdSet(os.Args[2:])
 	case "log":
 		cmdLog(os.Args[2:])
+	case "profile":
+		cmdProfile(os.Args[2:])
 	case "uninstall":
 		cmdDown()
 		os.RemoveAll(stateDir)
@@ -113,6 +130,8 @@ managed mode (settings in /opt/nordtv/config):
   nordtv start [CC] [--no-ks|--ks]   start in background (optionally change country/kill switch)
   nordtv stop | restart
   nordtv set country CC | set killswitch on|off | set token TOKEN
+  nordtv set provider nordvpn|wireguard | set profile NAME
+  nordtv profile list | add NAME < file.conf | remove NAME   saved WireGuard configs
   nordtv log [N]
   nordtv state | status -json        machine-readable state (status adds public IP)
   nordtv verify                      check the saved token against NordVPN
@@ -126,7 +145,7 @@ var httpc = &http.Client{Timeout: 20 * time.Second}
 
 func apiGet(u string, token string, out any) error {
 	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", "nordtv/1.0")
+	req.Header.Set("User-Agent", "nordtv/1.1")
 	if token != "" {
 		req.SetBasicAuth("token", token)
 	}
@@ -263,21 +282,35 @@ func nordConf(token, countryCode, host string) (*wgConf, error) {
 		Endpoint:   net.JoinHostPort(srv.Station, "51820"),
 		Keepalive:  25,
 		Label:      fmt.Sprintf("%s (load %d%%)", srv.Hostname, srv.Load),
+		Allowed:    []string{"0.0.0.0/0"},
 	}, nil
 }
 
 // ---------------- wg-quick style .conf ----------------
 
 func parseConf(path string) (*wgConf, error) {
-	f, err := os.Open(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	c := &wgConf{MTU: 1420, Keepalive: 25, Label: path}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(strings.SplitN(sc.Text(), "#", 2)[0])
+	label := path
+	if dir, name, ok := strings.Cut(path, profileDir+"/"); ok && dir == "" {
+		label = strings.TrimSuffix(name, ".conf") // a saved profile: its name
+	}
+	return parseConfText(string(b), label)
+}
+
+// parseConfText reads a wg-quick file with one [Peer]. IPv6 addresses, DNS servers and AllowedIPs are skipped: the
+// tunnel is IPv4 and IPv6 egress is blocked while it runs. No AllowedIPs line means the full tunnel.
+func parseConfText(text, label string) (*wgConf, error) {
+	c := &wgConf{MTU: 1420, Keepalive: 25, Label: label}
+	peers, sawAllowed := 0, false
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(strings.SplitN(raw, "#", 2)[0])
+		if strings.EqualFold(line, "[peer]") {
+			peers++
+			continue
+		}
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
@@ -293,6 +326,9 @@ func parseConf(path string) (*wgConf, error) {
 					if !strings.Contains(a, "/") {
 						a += "/32"
 					}
+					if ip, _, err := net.ParseCIDR(a); err != nil || ip.To4() == nil {
+						return nil, fmt.Errorf("bad Address %q", a)
+					}
 					c.Address = a
 				}
 			}
@@ -306,14 +342,75 @@ func parseConf(path string) (*wgConf, error) {
 			c.MTU, _ = strconv.Atoi(v)
 		case "publickey":
 			c.PeerPub = v
+		case "presharedkey":
+			c.PSK = v
 		case "endpoint":
 			c.Endpoint = v
 		case "persistentkeepalive":
 			c.Keepalive, _ = strconv.Atoi(v)
+		case "allowedips":
+			sawAllowed = true
+			for _, a := range strings.Split(v, ",") {
+				a = strings.TrimSpace(a)
+				if !strings.Contains(a, ".") {
+					continue // IPv6
+				}
+				if !strings.Contains(a, "/") {
+					a += "/32"
+				}
+				_, n, err := net.ParseCIDR(a)
+				if err != nil || n.IP.To4() == nil {
+					return nil, fmt.Errorf("bad AllowedIPs entry %q", a)
+				}
+				c.Allowed = append(c.Allowed, n.String())
+			}
 		}
 	}
-	if c.PrivateKey == "" || c.PeerPub == "" || c.Endpoint == "" || c.Address == "" {
-		return nil, errors.New("conf needs PrivateKey, Address, PublicKey, Endpoint")
+	if peers > 1 {
+		return nil, errors.New("conf has more than one [Peer]; only one is supported")
+	}
+	if c.PrivateKey == "" || c.PeerPub == "" || c.Endpoint == "" {
+		return nil, errors.New("conf needs PrivateKey, Address, PublicKey and Endpoint")
+	}
+	if c.Address == "" {
+		return nil, errors.New("conf has no IPv4 Address (IPv6-only servers are not supported)")
+	}
+	if !sawAllowed {
+		c.Allowed = []string{"0.0.0.0/0"}
+	} else if len(c.Allowed) == 0 {
+		return nil, errors.New("conf has no IPv4 AllowedIPs (IPv6-only tunnels are not supported)")
+	}
+	// 0.0.0.0/1 + 128.0.0.0/1 is the usual "everything" written so it wins over a default route: same thing here.
+	half := map[string]bool{}
+	for _, a := range c.Allowed {
+		half[a] = true
+	}
+	if half["0.0.0.0/1"] && half["128.0.0.0/1"] {
+		c.Allowed = []string{"0.0.0.0/0"}
+	}
+	if c.full() {
+		c.Allowed = []string{"0.0.0.0/0"}
+	}
+	if c.MTU < 1280 || c.MTU > 1500 {
+		return nil, fmt.Errorf("MTU %d out of range (1280-1500)", c.MTU)
+	}
+	if c.Keepalive < 0 || c.Keepalive > 3600 {
+		return nil, errors.New("PersistentKeepalive out of range")
+	}
+	for name, k := range map[string]string{"PrivateKey": c.PrivateKey, "PublicKey": c.PeerPub, "PresharedKey": c.PSK} {
+		if k == "" && name == "PresharedKey" {
+			continue
+		}
+		if _, err := b64hex(k); err != nil {
+			return nil, fmt.Errorf("%s is not a WireGuard key", name)
+		}
+	}
+	host, port, err := net.SplitHostPort(c.Endpoint)
+	if err != nil || host == "" || port == "" {
+		return nil, fmt.Errorf("bad Endpoint %q (want host:port)", c.Endpoint)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return nil, errors.New("Endpoint is IPv6; only IPv4 servers are supported")
 	}
 	return c, nil
 }
@@ -387,10 +484,26 @@ func cmdUp(args []string) {
 	if err != nil {
 		log.Fatal("peer key: ", err)
 	}
-	ep, err := net.ResolveUDPAddr("udp4", c.Endpoint)
+	var psk string
+	if c.PSK != "" {
+		if psk, err = b64hex(c.PSK); err != nil {
+			log.Fatal("preshared key: ", err)
+		}
+	}
+	// The endpoint may be a host name, and at boot DNS may not work yet.
+	var ep *net.UDPAddr
+	for i := 0; ; i++ {
+		ep, err = net.ResolveUDPAddr("udp4", c.Endpoint)
+		if err == nil || i >= 20 {
+			break
+		}
+		log.Printf("endpoint: %v (retrying)", err)
+		time.Sleep(15 * time.Second)
+	}
 	if err != nil {
 		log.Fatal("endpoint: ", err)
 	}
+	split := !c.full()
 
 	cleanup(false) // remove leftovers from a crash
 
@@ -400,8 +513,14 @@ func cmdUp(args []string) {
 	}
 	logger := device.NewLogger(device.LogLevelError, "wg: ")
 	dev := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
-	uapi := fmt.Sprintf("private_key=%s\nfwmark=%d\nreplace_peers=true\npublic_key=%s\nendpoint=%s\npersistent_keepalive_interval=%d\nreplace_allowed_ips=true\nallowed_ip=0.0.0.0/0\n",
-		priv, fwMark, pub, ep.String(), c.Keepalive)
+	uapi := fmt.Sprintf("private_key=%s\nfwmark=%d\nreplace_peers=true\npublic_key=%s\n", priv, fwMark, pub)
+	if psk != "" {
+		uapi += "preshared_key=" + psk + "\n"
+	}
+	uapi += fmt.Sprintf("endpoint=%s\npersistent_keepalive_interval=%d\nreplace_allowed_ips=true\n", ep.String(), c.Keepalive)
+	for _, a := range c.Allowed {
+		uapi += "allowed_ip=" + a + "\n"
+	}
 	if err := dev.IpcSet(uapi); err != nil {
 		log.Fatal("configure: ", err)
 	}
@@ -409,13 +528,24 @@ func cmdUp(args []string) {
 		log.Fatal("up: ", err)
 	}
 
+	// Table 51820 holds the tunnel's routes: the default route, or only the AllowedIPs of a split tunnel. The
+	// suppress_prefixlength rule makes every specific route of the main table win, so the home network (the LAN's
+	// own route) never goes into the tunnel; anything not in table 51820 falls through to the main table.
 	steps := [][]string{
 		{"ip", "addr", "add", c.Address, "dev", ifName},
 		{"ip", "link", "set", ifName, "up", "mtu", strconv.Itoa(c.MTU)},
-		{"ip", "route", "add", "default", "dev", ifName, "table", strconv.Itoa(table)},
-		{"ip", "rule", "add", "not", "fwmark", strconv.Itoa(fwMark), "table", strconv.Itoa(table), "pref", strconv.Itoa(rulePref + 1)},
-		{"ip", "rule", "add", "table", "main", "suppress_prefixlength", "0", "pref", strconv.Itoa(rulePref)},
 	}
+	for _, a := range c.Allowed {
+		dst := a
+		if dst == "0.0.0.0/0" {
+			dst = "default"
+		}
+		steps = append(steps, []string{"ip", "route", "add", dst, "dev", ifName, "table", strconv.Itoa(table)})
+	}
+	steps = append(steps,
+		[]string{"ip", "rule", "add", "not", "fwmark", strconv.Itoa(fwMark), "table", strconv.Itoa(table), "pref", strconv.Itoa(rulePref + 1)},
+		[]string{"ip", "rule", "add", "table", "main", "suppress_prefixlength", "0", "pref", strconv.Itoa(rulePref)},
+	)
 	for _, s := range steps {
 		if err := sh(s...); err != nil {
 			dev.Close()
@@ -431,20 +561,26 @@ func cmdUp(args []string) {
 	shq("ip6tables", "-A", chain, "-j", "REJECT")
 	shq("ip6tables", "-I", "OUTPUT", "1", "-j", chain)
 
-	// Force all DNS (the router from DHCP and resolvers hardcoded by apps) to the VPN resolver
+	// Force all DNS (the router from DHCP and resolvers hardcoded by apps) to the VPN resolver. A split tunnel
+	// does this only when its .conf names a DNS server; otherwise the TV keeps its own.
 	dns := c.DNS
-	if len(dns) == 0 {
-		dns = nordDNS
+	if len(dns) == 0 && !split {
+		dns = fallbackDNS
 	}
-	shq("iptables", "-t", "nat", "-N", natChain)
-	for _, p := range []string{"udp", "tcp"} {
-		shq("iptables", "-t", "nat", "-A", natChain, "-o", "lo", "-j", "RETURN")
-		shq("iptables", "-t", "nat", "-A", natChain, "-p", p, "--dport", "53", "-j", "DNAT", "--to-destination", dns[0]+":53")
+	if len(dns) > 0 {
+		shq("iptables", "-t", "nat", "-N", natChain)
+		for _, p := range []string{"udp", "tcp"} {
+			shq("iptables", "-t", "nat", "-A", natChain, "-o", "lo", "-j", "RETURN")
+			shq("iptables", "-t", "nat", "-A", natChain, "-p", p, "--dport", "53", "-j", "DNAT", "--to-destination", dns[0]+":53")
+		}
+		shq("iptables", "-t", "nat", "-I", "OUTPUT", "1", "-j", natChain)
 	}
-	shq("iptables", "-t", "nat", "-I", "OUTPUT", "1", "-j", natChain)
 	shq("ip", "route", "flush", "cache")
 
-	if *ks {
+	if *ks && split {
+		// The kill switch would cut the internet that a split tunnel leaves outside on purpose.
+		log.Print("kill switch not used: split tunnel (only AllowedIPs go through the VPN)")
+	} else if *ks {
 		// allow: loopback, tunnel, LAN, the WG endpoint (marked packets); drop everything else
 		shq("iptables", "-N", chain)
 		shq("iptables", "-A", chain, "-o", "lo", "-j", "RETURN")
@@ -461,6 +597,11 @@ func cmdUp(args []string) {
 
 	os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
 	os.WriteFile("/tmp/nordtv.server", []byte(c.Label+"\n"), 0644)
+	mode := "full"
+	if split {
+		mode = "split " + strings.Join(c.Allowed, ",")
+	}
+	os.WriteFile("/tmp/nordtv.mode", []byte(mode+"\n"), 0644)
 	log.Printf("tunnel %s up", ifName)
 
 	sig := make(chan os.Signal, 1)
@@ -475,6 +616,7 @@ func cmdUp(args []string) {
 			cleanup(true)
 			os.Remove(pidFile)
 			os.Remove("/tmp/nordtv.server")
+			os.Remove("/tmp/nordtv.mode")
 			return
 		case <-dev.Wait():
 			log.Print("device closed")
@@ -493,6 +635,14 @@ func cmdUp(args []string) {
 				}
 			}
 			if time.Since(lastOK) > 5*time.Minute {
+				// A host-name endpoint may have moved: resolve it again (the kill switch follows the new address).
+				if nep, err := net.ResolveUDPAddr("udp4", c.Endpoint); err == nil && !nep.IP.Equal(ep.IP) {
+					log.Printf("endpoint moved to %s", nep)
+					if *ks && !split {
+						shq("iptables", "-I", chain, "1", "-p", "udp", "-d", nep.IP.String(), "--dport", strconv.Itoa(nep.Port), "-j", "RETURN")
+					}
+					ep = nep
+				}
 				log.Print("no handshake for 5 min, re-setting endpoint")
 				dev.IpcSet(fmt.Sprintf("public_key=%s\nendpoint=%s\n", pub, ep.String()))
 				lastOK = time.Now()
@@ -580,7 +730,7 @@ func cmdStatus() {
 	srv, _ := os.ReadFile("/tmp/nordtv.server")
 	fmt.Printf("nordtv: up (pid %d) server %s", pid, srv)
 	c := cfgLoad()
-	fmt.Printf("settings: country=%s killswitch=%s\n", c["COUNTRY"], c["KILLSWITCH"])
+	fmt.Printf("settings: provider=%s profile=%s country=%s killswitch=%s\n", c["PROVIDER"], c["PROFILE"], c["COUNTRY"], c["KILLSWITCH"])
 	resp, err := httpc.Get("https://api.nordvpn.com/v1/helpers/ips/insights")
 	if err == nil {
 		defer resp.Body.Close()

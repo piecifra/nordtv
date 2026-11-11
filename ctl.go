@@ -3,19 +3,29 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-const cfgFile = stateDir + "/config"
+const (
+	cfgFile    = stateDir + "/config"
+	profileDir = stateDir + "/profiles" // saved WireGuard configs, <name>.conf, 0600
+	maxConf    = 16 << 10
+	maxProfile = 20
+)
+
+var profileName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`)
 
 func cfgLoad() map[string]string {
-	m := map[string]string{"COUNTRY": "IT", "KILLSWITCH": "1"}
+	m := map[string]string{"COUNTRY": "IT", "KILLSWITCH": "1", "PROVIDER": "nordvpn"}
 	b, _ := os.ReadFile(cfgFile)
 	for _, l := range strings.Split(string(b), "\n") {
 		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok {
@@ -29,7 +39,7 @@ func cfgSet(k, v string) {
 	m := cfgLoad()
 	m[k] = v
 	var sb strings.Builder
-	for _, key := range []string{"COUNTRY", "KILLSWITCH", "ENABLED", "AUTOSTART"} {
+	for _, key := range []string{"PROVIDER", "PROFILE", "COUNTRY", "KILLSWITCH", "ENABLED", "AUTOSTART"} {
 		if val, ok := m[key]; ok {
 			fmt.Fprintf(&sb, "%s=%s\n", key, val)
 		}
@@ -57,16 +67,25 @@ func cmdStart(args []string) {
 			os.Exit(2)
 		}
 	}
-	if running() {
-		cmdDown()
-	}
 	c := cfgLoad()
 	upArgs := []string{"up"}
-	if c["COUNTRY"] != "" {
+	if c["PROVIDER"] == "wireguard" {
+		// Check before taking a running tunnel down: a bad choice must not leave the TV without its VPN.
+		if !profileName.MatchString(c["PROFILE"]) {
+			fail(1, "no WireGuard profile chosen (nordtv set profile NAME)")
+		}
+		if _, err := parseConf(profilePath(c["PROFILE"])); err != nil {
+			fail(1, "profile "+c["PROFILE"]+":", err)
+		}
+		upArgs = append(upArgs, "-conf", profilePath(c["PROFILE"]))
+	} else if c["COUNTRY"] != "" {
 		upArgs = append(upArgs, "-country", c["COUNTRY"])
 	}
 	if c["KILLSWITCH"] == "1" {
 		upArgs = append(upArgs, "-killswitch")
+	}
+	if running() {
+		cmdDown()
 	}
 	self, _ := os.Executable()
 	logf, err := os.OpenFile(stateDir+"/log", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
@@ -96,7 +115,7 @@ func cmdStart(args []string) {
 
 func cmdSet(a []string) {
 	if len(a) != 2 {
-		fmt.Fprintln(os.Stderr, "set country CC | set killswitch on|off | set token TOKEN")
+		fmt.Fprintln(os.Stderr, "set country CC | set killswitch on|off | set autostart on|off | set token TOKEN | set provider nordvpn|wireguard | set profile NAME")
 		os.Exit(2)
 	}
 	switch a[0] {
@@ -109,6 +128,16 @@ func cmdSet(a []string) {
 			os.Exit(2)
 		}
 		cfgSet(strings.ToUpper(a[0]), v)
+	case "provider":
+		if a[1] != "nordvpn" && a[1] != "wireguard" {
+			fail(2, "nordvpn|wireguard")
+		}
+		cfgSet("PROVIDER", a[1])
+	case "profile":
+		if _, err := os.Stat(profilePath(a[1])); !profileName.MatchString(a[1]) || err != nil {
+			fail(1, "no saved profile", a[1], "(nordtv profile list)")
+		}
+		cfgSet("PROFILE", a[1])
 	case "token":
 		os.MkdirAll(stateDir, 0700)
 		os.WriteFile(stateDir+"/token", []byte(a[1]+"\n"), 0600)
@@ -137,33 +166,137 @@ func cmdLog(a []string) {
 	fmt.Println(strings.Join(keep, "\n"))
 }
 
+func profilePath(name string) string { return profileDir + "/" + name + ".conf" }
+
+// profile is what the state shows of a saved config: never its keys.
+type profile struct {
+	Name     string   `json:"name"`
+	Endpoint string   `json:"endpoint,omitempty"`
+	Address  string   `json:"address,omitempty"`
+	Split    bool     `json:"split"`
+	Allowed  []string `json:"allowedIps"`
+	DNS      []string `json:"dns"`
+	Error    string   `json:"error,omitempty"`
+}
+
+func profiles() []profile {
+	entries, _ := os.ReadDir(profileDir)
+	out := []profile{}
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".conf")
+		if !ok || !e.Type().IsRegular() || !profileName.MatchString(name) {
+			continue
+		}
+		p := profile{Name: name, Allowed: []string{}, DNS: []string{}}
+		if c, err := parseConf(profilePath(name)); err != nil {
+			p.Error = err.Error()
+		} else {
+			p.Endpoint, p.Address, p.Split, p.Allowed = c.Endpoint, c.Address, !c.full(), c.Allowed
+			if c.DNS != nil {
+				p.DNS = c.DNS
+			}
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	return out
+}
+
+func fail(code int, msg ...any) {
+	fmt.Fprintln(os.Stderr, msg...)
+	os.Exit(code)
+}
+
+// nordtv profile list | add NAME (the .conf on stdin) | remove NAME
+func cmdProfile(a []string) {
+	switch {
+	case len(a) == 1 && a[0] == "list":
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"profiles": profiles()})
+	case len(a) == 2 && a[0] == "add":
+		name := a[1]
+		if !profileName.MatchString(name) {
+			fail(2, "profile name: letters, digits, - and _, up to 32")
+		}
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, maxConf+1))
+		if err != nil || len(b) > maxConf {
+			fail(1, "conf too large or unreadable")
+		}
+		if _, err := parseConfText(string(b), name); err != nil {
+			fail(1, err)
+		}
+		if _, err := os.Stat(profilePath(name)); err != nil && len(profiles()) >= maxProfile {
+			fail(1, "at most", maxProfile, "profiles")
+		}
+		os.MkdirAll(profileDir, 0700)
+		os.Chmod(profileDir, 0700)
+		tmp := profilePath(name) + ".new"
+		if err := os.WriteFile(tmp, b, 0600); err != nil {
+			fail(1, err)
+		}
+		if err := os.Rename(tmp, profilePath(name)); err != nil {
+			os.Remove(tmp)
+			fail(1, err)
+		}
+		fmt.Println("saved profile", name)
+	case len(a) == 2 && a[0] == "remove":
+		if !profileName.MatchString(a[1]) {
+			fail(2, "bad profile name")
+		}
+		if err := os.Remove(profilePath(a[1])); err != nil {
+			fail(1, "no saved profile", a[1])
+		}
+		if c := cfgLoad(); c["PROFILE"] == a[1] {
+			cfgSet("PROFILE", "")
+		}
+		fmt.Println("removed profile", a[1])
+	default:
+		fail(2, "profile list | add NAME < file.conf | remove NAME")
+	}
+}
+
 type stateOut struct {
-	Running    bool   `json:"running"`
-	Pid        int    `json:"pid,omitempty"`
-	Server     string `json:"server,omitempty"`
-	Country    string `json:"country"`
-	KillSwitch bool   `json:"killswitch"`
-	Enabled    bool   `json:"enabled"`
-	Autostart  bool   `json:"autostart"`
-	HasToken   bool   `json:"hasToken"`
-	Since      int64  `json:"since,omitempty"`
-	PublicIP   string `json:"publicIp,omitempty"`
-	City       string `json:"city,omitempty"`
-	IPCountry  string `json:"ipCountry,omitempty"`
-	Protected  *bool  `json:"protected,omitempty"`
-	LastError  string `json:"lastError,omitempty"`
+	Provider   string    `json:"provider"`
+	Profile    string    `json:"profile"`
+	Profiles   []profile `json:"profiles"`
+	Ready      bool      `json:"ready"` // what the provider needs is saved: a token, or a valid chosen profile
+	Mode       string    `json:"mode,omitempty"`
+	Running    bool      `json:"running"`
+	Pid        int       `json:"pid,omitempty"`
+	Server     string    `json:"server,omitempty"`
+	Country    string    `json:"country"`
+	KillSwitch bool      `json:"killswitch"`
+	Enabled    bool      `json:"enabled"`
+	Autostart  bool      `json:"autostart"`
+	HasToken   bool      `json:"hasToken"`
+	Since      int64     `json:"since,omitempty"`
+	PublicIP   string    `json:"publicIp,omitempty"`
+	City       string    `json:"city,omitempty"`
+	IPCountry  string    `json:"ipCountry,omitempty"`
+	Protected  *bool     `json:"protected,omitempty"`
+	LastError  string    `json:"lastError,omitempty"`
 }
 
 func cmdStateJSON(withIP bool) {
 	c := cfgLoad()
-	o := stateOut{Country: c["COUNTRY"], KillSwitch: c["KILLSWITCH"] == "1", Enabled: c["ENABLED"] == "1", Autostart: c["AUTOSTART"] != "0"}
+	o := stateOut{Provider: c["PROVIDER"], Profile: c["PROFILE"], Profiles: profiles(), Country: c["COUNTRY"], KillSwitch: c["KILLSWITCH"] == "1", Enabled: c["ENABLED"] == "1", Autostart: c["AUTOSTART"] != "0"}
 	if b, err := os.ReadFile(stateDir + "/token"); err == nil && len(strings.TrimSpace(string(b))) > 0 {
 		o.HasToken = true
+	}
+	if o.Provider == "wireguard" {
+		for _, p := range o.Profiles {
+			if p.Name == o.Profile && p.Error == "" {
+				o.Ready = true
+			}
+		}
+	} else {
+		o.Ready = o.HasToken
 	}
 	if running() {
 		o.Running, o.Pid = true, readPid()
 		b, _ := os.ReadFile("/tmp/nordtv.server")
 		o.Server = strings.TrimSpace(string(b))
+		m, _ := os.ReadFile("/tmp/nordtv.mode")
+		o.Mode = strings.TrimSpace(string(m))
 		if fi, err := os.Stat(pidFile); err == nil {
 			o.Since = fi.ModTime().Unix()
 		}
@@ -235,6 +368,15 @@ func secureState() {
 		return
 	}
 	os.Chmod(stateDir, 0700)
+	os.Chmod(profileDir, 0700)
+	if pe, err := os.ReadDir(profileDir); err == nil {
+		for _, e := range pe {
+			if e.Type().IsRegular() {
+				os.Lchown(profileDir+"/"+e.Name(), 0, 0)
+				os.Chmod(profileDir+"/"+e.Name(), 0600)
+			}
+		}
+	}
 	entries, _ := os.ReadDir(stateDir)
 	for _, e := range entries {
 		if !e.Type().IsRegular() {
