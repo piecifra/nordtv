@@ -23,12 +23,13 @@ GOTOOLCHAIN=go1.26.0 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 GOFLAGS=-mod=re
 gzip -9 -n -c dist/nordtv-armv7 > dist/nordtv.gz
 ```
 
-Dependencies are pinned in `go.mod` and `go.sum`. Compare your `dist/SHA256SUMS` with the release's:
+Dependencies are pinned in `go.mod` and `go.sum`. Compare your `dist/SHA256SUMS` with the release's (the `.gz` hash also depends on the gzip in use; `gunzip -c dist/nordtv.gz | shasum -a 256` compares the program itself):
 
 | Release | `nordtv.gz` SHA-256 |
 |---|---|
 | v1.0.0 | `a7f033196957c03ae867ce5d4791b8590ac9cf024b15fcf4392abe9e30622af3` |
 | v1.1.0 | `5e1156501e49bcb6077c056cea404b1c6bc7aeba6a923db0be4291c718189866` |
+| v1.1.1 | `d9ce340d9accd43f95f83d7c48e5be5e3ada721c23804a7b5a80e70bf45620b9` (program: `92058145d71583e46393453070a8324b1e85d8ff971ab4e438d2aa5fe9ef8444`) |
 
 Any change to the binary gets a new release and a new hash; the Shard pins one exact hash per version.
 

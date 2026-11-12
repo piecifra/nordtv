@@ -447,6 +447,10 @@ func cmdUp(args []string) {
 	if pid := readPid(); pid > 0 && syscall.Kill(pid, 0) == nil {
 		log.Fatalf("already running (pid %d); run 'nordtv down' first", pid)
 	}
+	// Nothing is running, so any rule left here is from a crash: remove it before the first network call. A kill
+	// switch or DNS redirect left behind would block the API call and the endpoint lookup, and the TV would stay
+	// offline instead of reconnecting.
+	cleanup(false)
 
 	var c *wgConf
 	var err error
