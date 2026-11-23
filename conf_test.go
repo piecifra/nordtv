@@ -1,6 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -95,4 +102,82 @@ func TestProfileNames(t *testing.T) {
 			t.Errorf("%q accepted", bad)
 		}
 	}
+}
+
+func TestIsNordtvUp(t *testing.T) {
+	for cmdline, want := range map[string]bool{
+		"/dev/shm/nordtv\x00up\x00-country\x00IT\x00":       true, // 1.0.0 to 1.1.1
+		"/dev/shm/nordtv.d/nordtv\x00up\x00-killswitch\x00": true,
+		"/opt/nordtv/nordtv\x00up\x00":                      true,
+		"/dev/shm/nordtv\x00down\x00":                       false,
+		"/bin/sh\x00-c\x00/dev/shm/nordtv up\x00":           false,
+		"/usr/bin/evil-nordtv\x00up\x00":                    false,
+		"":                                                  false,
+	} {
+		if got := isNordtvUp([]byte(cmdline)); got != want {
+			t.Errorf("%q: got %v", cmdline, got)
+		}
+	}
+}
+
+func TestEpReturn(t *testing.T) {
+	ep := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 53}
+	got := epReturn(ep, "iptables", "-t", "nat", "-I", natChain, "1")
+	want := []string{"iptables", "-t", "nat", "-I", "NORDTV_DNS", "1", "-p", "udp", "-d", "203.0.113.7", "--dport", "53", "-j", "RETURN"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+// The lock `nordtv up` takes: held by another process, it is seen (with that process's pid) and refused; a reader
+// never takes it; once that process is gone, crashed or not, it is free.
+func TestUpLock(t *testing.T) {
+	if os.Getenv("NORDTV_HOLD_LOCK") != "" {
+		f, err := takeLockAt(os.Getenv("NORDTV_HOLD_LOCK"))
+		if err != nil {
+			fmt.Println("ERR", err)
+			os.Exit(1)
+		}
+		fmt.Println("HELD")
+		io.ReadAll(os.Stdin) // until the test closes our stdin
+		f.Close()
+		os.Exit(0)
+	}
+	p := filepath.Join(t.TempDir(), "lock")
+	if pid := lockHolderAt(p); pid != 0 {
+		t.Fatalf("no file: holder %d", pid)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestUpLock$")
+	cmd.Env = append(os.Environ(), "NORDTV_HOLD_LOCK="+p)
+	stdin, _ := cmd.StdinPipe()
+	out, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	line, _ := bufio.NewReader(out).ReadString('\n')
+	if strings.TrimSpace(line) != "HELD" {
+		t.Fatalf("helper: %q", line)
+	}
+	for i := 0; i < 3; i++ { // reading the holder again and again must not take the lock
+		if pid := lockHolderAt(p); pid != cmd.Process.Pid {
+			t.Fatalf("holder %d, want %d", pid, cmd.Process.Pid)
+		}
+	}
+	if f, err := takeLockAt(p); err == nil || !strings.Contains(err.Error(), "already running") {
+		if f != nil {
+			f.Close()
+		}
+		t.Fatalf("second lock: %v", err)
+	}
+	cmd.Process.Kill() // a crash: the lock goes with the process
+	stdin.Close()
+	cmd.Wait()
+	if pid := lockHolderAt(p); pid != 0 {
+		t.Fatalf("after the holder died: holder %d", pid)
+	}
+	f, err := takeLockAt(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
 }

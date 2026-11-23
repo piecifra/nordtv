@@ -30,6 +30,7 @@ Dependencies are pinned in `go.mod` and `go.sum`. Compare your `dist/SHA256SUMS`
 | v1.0.0 | `a7f033196957c03ae867ce5d4791b8590ac9cf024b15fcf4392abe9e30622af3` |
 | v1.1.0 | `5e1156501e49bcb6077c056cea404b1c6bc7aeba6a923db0be4291c718189866` |
 | v1.1.1 | `d9ce340d9accd43f95f83d7c48e5be5e3ada721c23804a7b5a80e70bf45620b9` (program: `92058145d71583e46393453070a8324b1e85d8ff971ab4e438d2aa5fe9ef8444`) |
+| v1.1.2 | `b56117fb6d34fbb09f9d5acfaab76a256f67de9386f94c6c7fc8e0a32ecc57e4` (program: `df043b5876bd1b078dff04de65fb1fe80606e7c9381555e04ab3b198bc73d255`) |
 
 Any change to the binary gets a new release and a new hash; the Shard pins one exact hash per version.
 
@@ -39,7 +40,7 @@ Any change to the binary gets a new release and a new hash; the Shard pins one e
   recommended server (optionally in one country).
 - **WireGuard:** uses a saved profile, a `wg-quick` config in `/opt/nordtv/profiles/NAME.conf`. Supported:
   `PrivateKey`, `Address`, `DNS`, `MTU`, and one `[Peer]` with `PublicKey`, `PresharedKey`, `AllowedIPs`, `Endpoint`
-  (address or host name, looked up again when the connection drops) and `PersistentKeepalive`. IPv4 only: IPv6
+  (address or host name) and `PersistentKeepalive`. IPv4 only: IPv6
   entries are skipped, and a config without an IPv4 address or `AllowedIPs`, or with an IPv6 endpoint, is refused.
 - Brings up a `nordtun` interface on `/dev/net/tun` and routes like `wg-quick` (fwmark 51820, table 51820,
   `suppress_prefixlength 0`), so the home network always stays reachable. **Full tunnel** (`AllowedIPs = 0.0.0.0/0`,
@@ -50,6 +51,14 @@ Any change to the binary gets a new release and a new hash; the Shard pins one e
 - **Kill switch, on by default:** while it runs, internet traffic outside the tunnel is rejected. If the VPN drops,
   the TV has no internet until it reconnects; the home network keeps working. `set killswitch off` disables it. Not
   used with a split profile, whose point is to leave the rest outside.
+- **No handshake for 5 minutes:** sets the endpoint again; a host name is looked up again first, past the dead
+  tunnel: the TV's own DNS servers (`/etc/resolv.conf`), from a socket marked 51820 (so outside the tunnel), with
+  the DNS redirect and the kill switch letting through only that socket's port to 53 while it runs (the tested TV's
+  kernel has no `iptables` `mark` match). `nordtv lookup HOST:PORT` does the same by hand. **15 minutes:** stops,
+  removing its rules, so that the next start connects from scratch.
+- **One at a time:** `up` takes a lock (`/dev/shm/nordtv.d/lock`) before anything else, so `down` stops it even
+  while it is still connecting, and a second `up` is refused. `start` runs it with `-deadline 40s`: not connected by
+  then, it removes what it set up and exits, even if `start` itself was killed.
 - `down`, `stop` and SIGTERM remove every route, rule, firewall chain and the `nordtun` interface it added.
 
 ### Commands it runs on the TV
@@ -69,7 +78,9 @@ Any change to the binary gets a new release and a new hash; the Shard pins one e
 
 `/opt/nordtv`, root only (folders `0700`, files `0600`, the binary `0700`): `config` (provider, profile, country,
 kill switch, enabled, keep connected), `token` (the NordVPN access token), `profiles/NAME.conf` (WireGuard configs,
-keys included), `log`. While running: `/tmp/nordtv.pid`, `/tmp/nordtv.server`, `/tmp/nordtv.mode`.
+keys included), `log`. While running, in `/dev/shm/nordtv.d` (root's own `0700` folder, in memory): `lock`, `pid`,
+`server`, `mode`. Up to 1.1.1 these were in `/tmp`; an `up` of those versions still running is recognised (by its
+`/proc` command line) and stopped by `down`.
 
 ## Commands
 
@@ -85,7 +96,9 @@ nordtv profile add NAME < x.conf   check and save a WireGuard config (NAME: lett
 nordtv profile remove NAME
 nordtv state | status -json        machine-readable state (status adds the public IP)
 nordtv verify                      check the saved token with NordVPN
-nordtv up [-token T | -conf wg.conf] [-country CC] [-server HOST] [-killswitch]   foreground
+nordtv lookup HOST:PORT            look a server up past the tunnel and the DNS redirect, as a running tunnel does
+nordtv version
+nordtv up [-token T | -conf wg.conf] [-country CC] [-server HOST] [-killswitch] [-deadline 40s]   foreground
 ```
 
 `-conf` runs any `wg-quick` file directly, with the same checks as a profile.

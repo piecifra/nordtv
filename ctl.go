@@ -20,6 +20,9 @@ const (
 	profileDir = stateDir + "/profiles" // saved WireGuard configs, <name>.conf, 0600
 	maxConf    = 16 << 10
 	maxProfile = 20
+	// startWait is how long `nordtv start` waits for the tunnel. The Shard gives the whole command 90 s, which also
+	// covers stopping a running tunnel first and the public IP check after.
+	startWait = 40 * time.Second
 )
 
 var profileName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`)
@@ -48,9 +51,9 @@ func cfgSet(k, v string) {
 	os.WriteFile(cfgFile, []byte(sb.String()), 0600)
 }
 
-func running() bool {
-	pid := readPid()
-	return pid > 0 && syscall.Kill(pid, 0) == nil
+func hasToken() bool {
+	b, err := os.ReadFile(stateDir + "/token")
+	return err == nil && len(strings.TrimSpace(string(b))) > 0
 }
 
 func cmdStart(args []string) {
@@ -68,7 +71,7 @@ func cmdStart(args []string) {
 		}
 	}
 	c := cfgLoad()
-	upArgs := []string{"up"}
+	upArgs := []string{"up", "-deadline", startWait.String()}
 	if c["PROVIDER"] == "wireguard" {
 		// Check before taking a running tunnel down: a bad choice must not leave the TV without its VPN.
 		if !profileName.MatchString(c["PROFILE"]) {
@@ -78,13 +81,18 @@ func cmdStart(args []string) {
 			fail(1, "profile "+c["PROFILE"]+":", err)
 		}
 		upArgs = append(upArgs, "-conf", profilePath(c["PROFILE"]))
-	} else if c["COUNTRY"] != "" {
-		upArgs = append(upArgs, "-country", c["COUNTRY"])
+	} else {
+		if !hasToken() {
+			fail(1, "no NordVPN token saved (nordtv set token TOKEN)")
+		}
+		if c["COUNTRY"] != "" {
+			upArgs = append(upArgs, "-country", c["COUNTRY"])
+		}
 	}
 	if c["KILLSWITCH"] == "1" {
 		upArgs = append(upArgs, "-killswitch")
 	}
-	if running() {
+	if upPid() > 0 { // running, or still connecting
 		cmdDown()
 	}
 	self, _ := os.Executable()
@@ -100,10 +108,43 @@ func cmdStart(args []string) {
 		fmt.Fprintln(os.Stderr, "start:", err)
 		os.Exit(1)
 	}
-	cmd.Process.Release()
+	exited := make(chan struct{})
+	go func() { cmd.Wait(); close(exited) }()
 	cfgSet("ENABLED", "1")
-	for i := 0; i < 30 && !running(); i++ {
-		time.Sleep(500 * time.Millisecond)
+	up := false
+wait:
+	for end := time.Now().Add(startWait + 5*time.Second); time.Now().Before(end); { // `up` gives up by itself at startWait
+		select {
+		case <-exited:
+			break wait
+		case <-time.After(500 * time.Millisecond):
+			if running() {
+				up = true
+				break wait
+			}
+		}
+	}
+	if !up {
+		// Do not leave it trying: an `up` still connecting after this start reported a failure could connect later,
+		// kill switch included, after the VPN was switched off or reset. SIGTERM makes it remove what it set up.
+		select {
+		case <-exited:
+		default:
+			fmt.Fprintf(os.Stderr, "not connected after %d s: stopped trying\n", int(startWait/time.Second))
+			syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
+			select {
+			case <-exited:
+			case <-time.After(5 * time.Second):
+				syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
+				<-exited
+			}
+		}
+		if upPid() == 0 {
+			cleanup(false)
+			removeRunFiles()
+		}
+		cmdLog([]string{"10"})
+		os.Exit(1)
 	}
 	time.Sleep(2 * time.Second)
 	cmdStatus()
@@ -261,6 +302,8 @@ type stateOut struct {
 	Ready      bool      `json:"ready"` // what the provider needs is saved: a token, or a valid chosen profile
 	Mode       string    `json:"mode,omitempty"`
 	Running    bool      `json:"running"`
+	Connecting bool      `json:"connecting"` // a `nordtv up` is on its way (API, endpoint lookup)
+	Version    string    `json:"version"`
 	Pid        int       `json:"pid,omitempty"`
 	Server     string    `json:"server,omitempty"`
 	Country    string    `json:"country"`
@@ -278,10 +321,7 @@ type stateOut struct {
 
 func cmdStateJSON(withIP bool) {
 	c := cfgLoad()
-	o := stateOut{Provider: c["PROVIDER"], Profile: c["PROFILE"], Profiles: profiles(), Country: c["COUNTRY"], KillSwitch: c["KILLSWITCH"] == "1", Enabled: c["ENABLED"] == "1", Autostart: c["AUTOSTART"] != "0"}
-	if b, err := os.ReadFile(stateDir + "/token"); err == nil && len(strings.TrimSpace(string(b))) > 0 {
-		o.HasToken = true
-	}
+	o := stateOut{Provider: c["PROVIDER"], Profile: c["PROFILE"], Profiles: profiles(), Country: c["COUNTRY"], KillSwitch: c["KILLSWITCH"] == "1", Enabled: c["ENABLED"] == "1", Autostart: c["AUTOSTART"] != "0", Version: version, HasToken: hasToken()}
 	if o.Provider == "wireguard" {
 		for _, p := range o.Profiles {
 			if p.Name == o.Profile && p.Error == "" {
@@ -292,14 +332,10 @@ func cmdStateJSON(withIP bool) {
 		o.Ready = o.HasToken
 	}
 	if running() {
-		o.Running, o.Pid = true, readPid()
-		b, _ := os.ReadFile("/tmp/nordtv.server")
-		o.Server = strings.TrimSpace(string(b))
-		m, _ := os.ReadFile("/tmp/nordtv.mode")
-		o.Mode = strings.TrimSpace(string(m))
-		if fi, err := os.Stat(pidFile); err == nil {
-			o.Since = fi.ModTime().Unix()
-		}
+		o.Running, o.Pid = true, upPid()
+		o.Server, o.Mode, o.Since = readRun(serverFile), readRun(modeFile), runSince()
+	} else if connecting() {
+		o.Connecting, o.Pid = true, upPid()
 	} else {
 		// last fatal line of the log, if the tunnel stopped on its own
 		b, _ := os.ReadFile(stateDir + "/log")
@@ -309,7 +345,7 @@ func cmdStateJSON(withIP bool) {
 		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 		for i := len(lines) - 1; i >= 0 && i >= len(lines)-5; i-- {
 			l := lines[i]
-			if l != "" && !strings.Contains(l, "sendmmsg") && !strings.Contains(l, "shutting down") && !strings.Contains(l, "restored") && !strings.Contains(l, "tunnel ") {
+			if l != "" && !strings.Contains(l, "sendmmsg") && !strings.Contains(l, "shutting down") && !strings.Contains(l, "restored") && !strings.Contains(l, "tunnel ") && !strings.Contains(l, "giving up") {
 				o.LastError = l
 				break
 			}
@@ -359,7 +395,8 @@ func cmdVerify() {
 }
 
 // secureState keeps /opt/nordtv root-only: root runs the binary from here and the token is a credential.
-// Folder 0700, everything in it 0600, the binary 0700. Files created later already get these modes.
+// Folder 0700, everything in it 0600, the binary 0700. Files created later already get these modes. The binary,
+// and the Shard's install while it unpacks one (nordtv.new.XXXXXX), only ever get 0700: never 0600 for a moment.
 func secureState() {
 	if os.Geteuid() != 0 {
 		return
@@ -384,7 +421,7 @@ func secureState() {
 		}
 		p := stateDir + "/" + e.Name()
 		os.Lchown(p, 0, 0)
-		if e.Name() == "nordtv" || strings.HasSuffix(e.Name(), ".new") {
+		if e.Name() == "nordtv" || strings.HasPrefix(e.Name(), "nordtv.new") {
 			os.Chmod(p, 0700)
 		} else {
 			os.Chmod(p, 0600)

@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -24,8 +25,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,14 +39,31 @@ import (
 )
 
 const (
+	version  = "1.1.2"
 	ifName   = "nordtun"
 	fwMark   = 51820
 	table    = 51820
 	rulePref = 31000
-	pidFile  = "/tmp/nordtv.pid"
 	stateDir = "/opt/nordtv"
 	chain    = "NORDTV"
 	natChain = "NORDTV_DNS"
+
+	// runDir is root-only (0700, made by ensureRunDir) and in memory, so nothing in it outlives a restart and no
+	// other user can plant a file there. Up to 1.1.1 these files were in /tmp, which anyone can write to.
+	runDir     = "/dev/shm/nordtv.d"
+	lockFile   = runDir + "/lock"   // write-locked (fcntl) by `nordtv up` from its first step to its exit
+	pidFile    = runDir + "/pid"    // written once the tunnel is up
+	serverFile = runDir + "/server" // what it connected to
+	modeFile   = runDir + "/mode"   // full, or split and the AllowedIPs
+
+	legacyPidFile = "/tmp/nordtv.pid" // nordtv 1.0.0 to 1.1.1, still running after an update
+
+	// Without a handshake for retryAfter, the endpoint is set again (a host name looked up again first); without one
+	// for giveUpAfter, `up` stops so that the next start (the Shard's "Keep connected") connects from scratch.
+	retryAfter  = 5 * time.Minute
+	giveUpAfter = 15 * time.Minute
+
+	soMark = 0x24 // SO_MARK on Linux (named here so the tests also build on other systems)
 )
 
 var nordDNS = []string{"103.86.96.100", "103.86.99.100"}
@@ -108,10 +128,22 @@ func main() {
 		cmdLog(os.Args[2:])
 	case "profile":
 		cmdProfile(os.Args[2:])
+	case "version":
+		fmt.Println(version)
+	case "lookup": // what a running tunnel does to find a host-name endpoint again (see lookupDirect)
+		if len(os.Args) != 3 {
+			usage()
+		}
+		ep, err := lookupDirect(os.Args[2])
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(ep)
 	case "uninstall":
 		cmdDown()
 		os.RemoveAll(stateDir)
-		os.Remove("/dev/shm/nordtv")
+		os.RemoveAll(runDir)
+		os.Remove("/dev/shm/nordtv") // where 1.0.0 to 1.1.1 ran from
 		fmt.Println("removed", stateDir)
 	default:
 		usage()
@@ -135,7 +167,8 @@ managed mode (settings in /opt/nordtv/config):
   nordtv log [N]
   nordtv state | status -json        machine-readable state (status adds public IP)
   nordtv verify                      check the saved token against NordVPN
-  nordtv uninstall`)
+  nordtv lookup HOST:PORT            look a server up past the tunnel and the DNS redirect, as a running tunnel does
+  nordtv version | uninstall`)
 	os.Exit(2)
 }
 
@@ -145,7 +178,7 @@ var httpc = &http.Client{Timeout: 20 * time.Second}
 
 func apiGet(u string, token string, out any) error {
 	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", "nordtv/1.1")
+	req.Header.Set("User-Agent", "nordtv/"+version)
 	if token != "" {
 		req.SetBasicAuth("token", token)
 	}
@@ -435,6 +468,10 @@ func sh(args ...string) error {
 
 func shq(args ...string) { _ = sh(args...) } // best effort
 
+// upLock is the lock file `nordtv up` holds for its whole life, kept in a variable so the garbage collector never
+// closes it. Closing any descriptor of that file would drop the lock, so `up` itself never calls lockHolder.
+var upLock *os.File
+
 func cmdUp(args []string) {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	token := fs.String("token", "", "NordVPN access token")
@@ -442,18 +479,79 @@ func cmdUp(args []string) {
 	cc := fs.String("country", "", "country code, e.g. US, GB, IT")
 	host := fs.String("server", "", "specific server hostname, e.g. us9591.nordvpn.com")
 	ks := fs.Bool("killswitch", false, "block non-VPN internet traffic while running")
+	deadline := fs.Duration("deadline", 0, "give up when not connected after this long (0: keep retrying for about 5 min)")
 	fs.Parse(args)
 
-	if pid := readPid(); pid > 0 && syscall.Kill(pid, 0) == nil {
-		log.Fatalf("already running (pid %d); run 'nordtv down' first", pid)
+	if err := ensureRunDir(); err != nil {
+		log.Fatal(err)
 	}
-	// Nothing is running, so any rule left here is from a crash: remove it before the first network call. A kill
-	// switch or DNS redirect left behind would block the API call and the endpoint lookup, and the TV would stay
-	// offline instead of reconnecting.
+	if pid := legacyUp(); pid > 0 {
+		log.Fatalf("an older nordtv is running (pid %d); run 'nordtv down' first", pid)
+	}
+	// The lock comes first, before any network call or rule: from here on `nordtv down` finds this process and stops
+	// it, even while it is still waiting for the API or the endpoint, and a second `up` refuses to start, so two of
+	// them can never remove each other's routes and chains.
+	var err error
+	if upLock, err = takeLock(); err != nil {
+		log.Fatal(err)
+	}
+	removeRunFiles() // a crashed run's files; the lock says nothing else is running
+
+	// While connecting, a signal, or the -deadline passing, stops this process at once, removing whatever it has set
+	// up so far. The steps that change the system hold mu, so neither lands between two of them; once the tunnel is
+	// up, the main loop takes the signals over and the deadline no longer counts. `nordtv start` passes a deadline,
+	// so an `up` it started never connects after it reported a failure, even if `start` itself was killed.
+	var (
+		mu   sync.Mutex
+		dev  *device.Device
+		live bool
+	)
+	sig := make(chan os.Signal, 1)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	var expire <-chan time.Time
+	if *deadline > 0 {
+		expire = time.After(*deadline)
+	}
+	go func() {
+		for {
+			code := 0
+			select {
+			case s := <-sig:
+				mu.Lock()
+				if live {
+					mu.Unlock()
+					quit <- s
+					return
+				}
+				log.Printf("got %v while connecting, shutting down", s)
+			case <-expire:
+				mu.Lock()
+				if live {
+					mu.Unlock()
+					expire = nil // a nil channel never fires: only signals from here on
+					continue
+				}
+				log.Printf("not connected after %v, giving up", *deadline)
+				code = 1
+			}
+			if dev != nil {
+				dev.Close()
+			}
+			cleanup(true)
+			removeRunFiles()
+			os.Exit(code)
+		}
+	}()
+
+	// Nothing else is running (the lock), so any rule left here is from a crash: remove it before the first network
+	// call. A kill switch or DNS redirect left behind would block the API call and the endpoint lookup, and the TV
+	// would stay offline instead of reconnecting.
+	mu.Lock()
 	cleanup(false)
+	mu.Unlock()
 
 	var c *wgConf
-	var err error
 	if *confPath != "" {
 		c, err = parseConf(*confPath)
 	} else {
@@ -508,15 +606,18 @@ func cmdUp(args []string) {
 		log.Fatal("endpoint: ", err)
 	}
 	split := !c.full()
+	epHost, _, _ := net.SplitHostPort(c.Endpoint)
+	byName := net.ParseIP(epHost) == nil
 
-	cleanup(false) // remove leftovers from a crash
+	mu.Lock() // released when the tunnel is up
+	cleanup(false)
 
 	tdev, err := tun.CreateTUN(ifName, c.MTU)
 	if err != nil {
 		log.Fatal("create tun: ", err)
 	}
 	logger := device.NewLogger(device.LogLevelError, "wg: ")
-	dev := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
+	dev = device.NewDevice(tdev, conn.NewDefaultBind(), logger)
 	uapi := fmt.Sprintf("private_key=%s\nfwmark=%d\nreplace_peers=true\npublic_key=%s\n", priv, fwMark, pub)
 	if psk != "" {
 		uapi += "preshared_key=" + psk + "\n"
@@ -566,21 +667,25 @@ func cmdUp(args []string) {
 	shq("ip6tables", "-I", "OUTPUT", "1", "-j", chain)
 
 	// Force all DNS (the router from DHCP and resolvers hardcoded by apps) to the VPN resolver. A split tunnel
-	// does this only when its .conf names a DNS server; otherwise the TV keeps its own.
+	// does this only when its .conf names a DNS server; otherwise the TV keeps its own. The WireGuard server itself
+	// is let through first, in case it listens on port 53.
 	dns := c.DNS
 	if len(dns) == 0 && !split {
 		dns = fallbackDNS
 	}
-	if len(dns) > 0 {
+	redirect := len(dns) > 0
+	if redirect {
 		shq("iptables", "-t", "nat", "-N", natChain)
+		shq("iptables", "-t", "nat", "-A", natChain, "-o", "lo", "-j", "RETURN")
+		shq(epReturn(ep, "iptables", "-t", "nat", "-A", natChain)...)
 		for _, p := range []string{"udp", "tcp"} {
-			shq("iptables", "-t", "nat", "-A", natChain, "-o", "lo", "-j", "RETURN")
 			shq("iptables", "-t", "nat", "-A", natChain, "-p", p, "--dport", "53", "-j", "DNAT", "--to-destination", dns[0]+":53")
 		}
 		shq("iptables", "-t", "nat", "-I", "OUTPUT", "1", "-j", natChain)
 	}
 	shq("ip", "route", "flush", "cache")
 
+	killswitch := *ks && !split
 	if *ks && split {
 		// The kill switch would cut the internet that a split tunnel leaves outside on purpose.
 		log.Print("kill switch not used: split tunnel (only AllowedIPs go through the VPN)")
@@ -589,7 +694,7 @@ func cmdUp(args []string) {
 		shq("iptables", "-N", chain)
 		shq("iptables", "-A", chain, "-o", "lo", "-j", "RETURN")
 		shq("iptables", "-A", chain, "-o", ifName, "-j", "RETURN")
-		shq("iptables", "-A", chain, "-p", "udp", "-d", ep.IP.String(), "--dport", strconv.Itoa(ep.Port), "-j", "RETURN")
+		shq(epReturn(ep, "iptables", "-A", chain)...)
 		shq("iptables", "-A", chain, "-m", "mark", "--mark", strconv.Itoa(fwMark), "-j", "RETURN") // if xt_mark exists
 		for _, n := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32"} {
 			shq("iptables", "-A", chain, "-d", n, "-j", "RETURN")
@@ -599,36 +704,35 @@ func cmdUp(args []string) {
 		log.Print("kill switch enabled")
 	}
 
-	os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
-	os.WriteFile("/tmp/nordtv.server", []byte(c.Label+"\n"), 0644)
+	os.WriteFile(serverFile, []byte(c.Label+"\n"), 0600)
 	mode := "full"
 	if split {
 		mode = "split " + strings.Join(c.Allowed, ",")
 	}
-	os.WriteFile("/tmp/nordtv.mode", []byte(mode+"\n"), 0644)
+	os.WriteFile(modeFile, []byte(mode+"\n"), 0600)
+	os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0600) // last: from here the state says "running"
+	live = true
+	mu.Unlock()
 	log.Printf("tunnel %s up", ifName)
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	tick := time.NewTicker(30 * time.Second)
-	var lastOK time.Time = time.Now()
+	lastOK := time.Now() // the last handshake, or the start
+	lastTry := lastOK
 	for {
 		select {
-		case s := <-sig:
+		case s := <-quit:
 			log.Printf("got %v, shutting down", s)
 			dev.Close()
 			cleanup(true)
-			os.Remove(pidFile)
-			os.Remove("/tmp/nordtv.server")
-			os.Remove("/tmp/nordtv.mode")
+			removeRunFiles()
 			return
 		case <-dev.Wait():
 			log.Print("device closed")
 			cleanup(true)
+			removeRunFiles()
 			os.Exit(1)
 		case <-tick.C:
-			hs := lastHandshake(dev)
-			if !hs.IsZero() {
+			if hs := lastHandshake(dev); hs.After(lastOK) {
 				lastOK = hs
 			}
 			// Wi-Fi reconnect / DHCP changes can wipe our rules; re-assert them.
@@ -638,21 +742,115 @@ func cmdUp(args []string) {
 					shq(s...)
 				}
 			}
-			if time.Since(lastOK) > 5*time.Minute {
-				// A host-name endpoint may have moved: resolve it again (the kill switch follows the new address).
-				if nep, err := net.ResolveUDPAddr("udp4", c.Endpoint); err == nil && !nep.IP.Equal(ep.IP) {
-					log.Printf("endpoint moved to %s", nep)
-					if *ks && !split {
-						shq("iptables", "-I", chain, "1", "-p", "udp", "-d", nep.IP.String(), "--dport", strconv.Itoa(nep.Port), "-j", "RETURN")
+			if time.Since(lastOK) > giveUpAfter {
+				// Whatever is wrong (a server gone, a new address the lookup below could not find), a fresh start
+				// fixes it: `up` removes every rule, looks the server up (NordVPN: asks for a new one) and connects.
+				log.Printf("no handshake for %d min, stopping so that the next start connects from scratch", int(giveUpAfter/time.Minute))
+				dev.Close()
+				cleanup(true)
+				removeRunFiles()
+				os.Exit(1)
+			}
+			if time.Since(lastOK) > retryAfter && time.Since(lastTry) > retryAfter {
+				lastTry = time.Now()
+				if byName {
+					// A host-name endpoint may have moved (a home server on a dynamic-DNS name): look it up again,
+					// past the tunnel, the DNS redirect and the kill switch (lookupDirect). The kill switch and
+					// the redirect let the new address through like the old one.
+					nep, err := lookupDirect(c.Endpoint)
+					if err != nil {
+						log.Printf("endpoint lookup: %v", err)
+					} else if !nep.IP.Equal(ep.IP) || nep.Port != ep.Port {
+						log.Printf("endpoint moved to %s", nep)
+						if killswitch {
+							shq(epReturn(nep, "iptables", "-I", chain, "1")...)
+						}
+						if redirect {
+							shq(epReturn(nep, "iptables", "-t", "nat", "-I", natChain, "1")...)
+						}
+						ep = nep
 					}
-					ep = nep
 				}
-				log.Print("no handshake for 5 min, re-setting endpoint")
+				log.Printf("no handshake for %d min, re-setting endpoint", int(time.Since(lastOK)/time.Minute))
 				dev.IpcSet(fmt.Sprintf("public_key=%s\nendpoint=%s\n", pub, ep.String()))
-				lastOK = time.Now()
 			}
 		}
 	}
+}
+
+// epReturn is the iptables command cmd (its first words) that lets the WireGuard server's UDP through.
+func epReturn(ep *net.UDPAddr, cmd ...string) []string {
+	return append(append([]string{}, cmd...), "-p", "udp", "-d", ep.IP.String(), "--dport", strconv.Itoa(ep.Port), "-j", "RETURN")
+}
+
+// lookupDirect looks up a host-name endpoint while the tunnel is up but not working. A plain lookup fails then: the
+// DNS redirect (NORDTV_DNS) sends it to the VPN's DNS server through the dead tunnel, and the routes and the kill
+// switch would not let it out either. This one asks the TV's own DNS servers (/etc/resolv.conf) from sockets
+// marked 51820, which the `not fwmark` rule routes outside the tunnel like WireGuard's own packets. For as long as
+// the lookup runs, NORDTV_DNS and the kill switch let through UDP from that socket's port to that server's port 53,
+// and nothing else: the TV's kernel has no `mark` match for iptables, so the port is what the rules can see.
+func lookupDirect(endpoint string) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	pn, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, fmt.Errorf("bad port in %q", endpoint)
+	}
+	var mu sync.Mutex
+	var undo [][]string
+	defer func() {
+		mu.Lock()
+		for _, u := range undo {
+			shq(u...)
+		}
+		mu.Unlock()
+	}()
+	r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if !strings.HasPrefix(network, "udp") {
+			return nil, errors.New("no TCP lookups here")
+		}
+		d := net.Dialer{Control: markSocket}
+		c, err := d.DialContext(ctx, "udp4", addr) // no packet is sent until the rules below are in place
+		if err != nil {
+			return nil, err
+		}
+		la, ra := c.LocalAddr().(*net.UDPAddr), c.RemoteAddr().(*net.UDPAddr)
+		match := []string{"-p", "udp", "--sport", strconv.Itoa(la.Port), "-d", ra.IP.String(), "--dport", strconv.Itoa(ra.Port), "-j", "RETURN"}
+		mu.Lock()
+		for _, at := range [][]string{{"iptables", "-t", "nat"}, {"iptables"}} {
+			ch := natChain
+			if len(at) == 1 {
+				ch = chain
+			}
+			add := append(append(append([]string{}, at...), "-I", ch, "1"), match...)
+			if sh(add...) == nil { // the kill switch chain is missing when it is off
+				undo = append(undo, append(append(append([]string{}, at...), "-D", ch), match...))
+			}
+		}
+		mu.Unlock()
+		return c, nil
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ips, err := r.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPv4 address for %s", host)
+	}
+	return &net.UDPAddr{IP: ips[0], Port: pn}, nil
+}
+
+// markSocket gives a socket WireGuard's fwmark, so its packets take the main routing table, outside the tunnel.
+func markSocket(network, address string, rc syscall.RawConn) error {
+	var serr error
+	if err := rc.Control(func(fd uintptr) { serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soMark, fwMark) }); err != nil {
+		return err
+	}
+	return serr
 }
 
 func lastHandshake(dev *device.Device) time.Time {
@@ -702,37 +900,167 @@ func cleanup(verbose bool) {
 	}
 }
 
-func readPid() int {
-	b, err := os.ReadFile(pidFile)
+// ensureRunDir makes runDir a real folder owned by root with mode 0700, replacing anything else found there (a
+// file, a link, or a folder someone else made). /dev/shm is writable by everyone, but sticky: once root owns the
+// folder no one else can remove or replace it.
+func ensureRunDir() error {
+	if fi, err := os.Lstat(runDir); err == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && fi.IsDir() && st.Uid == 0 {
+			return os.Chmod(runDir, 0700)
+		}
+		if err := os.RemoveAll(runDir); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(runDir, 0700); err != nil {
+		return fmt.Errorf("%s: %v", runDir, err)
+	}
+	return os.Chmod(runDir, 0700) // whatever the umask
+}
+
+// takeLock write-locks lockFile for this process, or says which `nordtv up` holds it.
+func takeLock() (*os.File, error) { return takeLockAt(lockFile) }
+
+func lockHolder() int { return lockHolderAt(lockFile) }
+
+func takeLockAt(p string) (*os.File, error) {
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return nil, err
+	}
+	lk := syscall.Flock_t{Type: syscall.F_WRLCK}
+	if err := syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lk); err != nil {
+		f.Close()
+		if pid := lockHolderAt(p); pid > 0 {
+			return nil, fmt.Errorf("already running (pid %d); run 'nordtv down' first", pid)
+		}
+		return nil, fmt.Errorf("lock %s: %v", p, err)
+	}
+	return f, nil
+}
+
+// lockHolderAt is the pid of the process holding the lock on p, or 0. It only asks (F_GETLK), so a status read can
+// never make an `up` fail to take the lock. A process that has exited holds no lock, crashed or not.
+func lockHolderAt(p string) int {
+	f, err := os.OpenFile(p, os.O_RDWR|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return 0
 	}
-	p, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-	return p
+	defer f.Close()
+	lk := syscall.Flock_t{Type: syscall.F_WRLCK}
+	if syscall.FcntlFlock(f.Fd(), syscall.F_GETLK, &lk) != nil || lk.Type == syscall.F_UNLCK {
+		return 0
+	}
+	return int(lk.Pid)
 }
 
+// legacyUp is the pid of a `nordtv up` from 1.0.0 to 1.1.1 (no lock, its pid in /tmp), or 0. A pid file in /tmp can
+// be planted, so the process must really be `nordtv up`.
+func legacyUp() int {
+	b, err := os.ReadFile(legacyPidFile)
+	if err != nil {
+		return 0
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	if pid <= 1 {
+		return 0
+	}
+	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+	if err != nil || !isNordtvUp(cmdline) {
+		return 0
+	}
+	return pid
+}
+
+// isNordtvUp tells whether a /proc/PID/cmdline is that of `nordtv up ...`.
+func isNordtvUp(cmdline []byte) bool {
+	args := strings.Split(string(cmdline), "\x00")
+	return len(args) >= 2 && path.Base(args[0]) == "nordtv" && args[1] == "up"
+}
+
+// upPid is the pid of the running or connecting `nordtv up`, or 0.
+func upPid() int {
+	if pid := lockHolder(); pid > 0 {
+		return pid
+	}
+	return legacyUp()
+}
+
+func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// running: the tunnel is up. connecting: a `nordtv up` is still on its way there (API, endpoint lookup).
+func running() bool {
+	if lockHolder() > 0 {
+		return exists(pidFile)
+	}
+	return legacyUp() > 0
+}
+
+func connecting() bool { return lockHolder() > 0 && !exists(pidFile) }
+
+// readRun reads one of the files `up` writes (or, for an older one still running, its file in /tmp).
+func readRun(p string) string {
+	if lockHolder() == 0 && legacyUp() > 0 {
+		p = "/tmp/nordtv." + path.Base(p)
+	}
+	b, _ := os.ReadFile(p)
+	return strings.TrimSpace(string(b))
+}
+
+// runSince is when the tunnel came up.
+func runSince() int64 {
+	p := pidFile
+	if lockHolder() == 0 && legacyUp() > 0 {
+		p = legacyPidFile
+	}
+	if fi, err := os.Stat(p); err == nil {
+		return fi.ModTime().Unix()
+	}
+	return 0
+}
+
+// removeRunFiles removes what `up` writes, the lock file excepted: removing it could split the lock in two.
+func removeRunFiles() {
+	for _, p := range []string{pidFile, serverFile, modeFile, legacyPidFile, "/tmp/nordtv.server", "/tmp/nordtv.mode"} {
+		os.Remove(p)
+	}
+}
+
+// cmdDown stops the `nordtv up` running or still connecting, and removes every rule, also when none is running.
 func cmdDown() {
-	pid := readPid()
-	if pid > 0 && syscall.Kill(pid, syscall.SIGTERM) == nil {
-		for i := 0; i < 50 && syscall.Kill(pid, 0) == nil; i++ {
-			time.Sleep(100 * time.Millisecond)
+	if pid := upPid(); pid > 0 && syscall.Kill(pid, syscall.SIGTERM) == nil {
+		if !waitDown(10 * time.Second) {
+			syscall.Kill(pid, syscall.SIGKILL)
+			waitDown(2 * time.Second)
 		}
 		fmt.Println("stopped")
 	} else {
 		fmt.Println("not running; cleaning up leftovers")
 	}
 	cleanup(false)
-	os.Remove(pidFile)
+	removeRunFiles()
+}
+
+// waitDown waits until no `nordtv up` is left (an exited process holds no lock, so a zombie counts as gone).
+func waitDown(d time.Duration) bool {
+	for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		if upPid() == 0 {
+			return true
+		}
+	}
+	return upPid() == 0
 }
 
 func cmdStatus() {
-	pid := readPid()
-	if pid == 0 || syscall.Kill(pid, 0) != nil {
+	if connecting() {
+		fmt.Printf("nordtv: connecting (pid %d)\n", upPid())
+		return
+	}
+	if !running() {
 		fmt.Println("nordtv: down")
 		return
 	}
-	srv, _ := os.ReadFile("/tmp/nordtv.server")
-	fmt.Printf("nordtv: up (pid %d) server %s", pid, srv)
+	fmt.Printf("nordtv: up (pid %d) server %s\n", upPid(), readRun(serverFile))
 	c := cfgLoad()
 	fmt.Printf("settings: provider=%s profile=%s country=%s killswitch=%s\n", c["PROVIDER"], c["PROFILE"], c["COUNTRY"], c["KILLSWITCH"])
 	resp, err := httpc.Get("https://api.nordvpn.com/v1/helpers/ips/insights")
