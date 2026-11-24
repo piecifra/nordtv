@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	version  = "1.1.2"
+	version  = "1.1.3"
 	ifName   = "nordtun"
 	fwMark   = 51820
 	table    = 51820
@@ -51,17 +51,30 @@ const (
 	// runDir is root-only (0700, made by ensureRunDir) and in memory, so nothing in it outlives a restart and no
 	// other user can plant a file there. Up to 1.1.1 these files were in /tmp, which anyone can write to.
 	runDir     = "/dev/shm/nordtv.d"
-	lockFile   = runDir + "/lock"   // write-locked (fcntl) by `nordtv up` from its first step to its exit
-	pidFile    = runDir + "/pid"    // written once the tunnel is up
-	serverFile = runDir + "/server" // what it connected to
-	modeFile   = runDir + "/mode"   // full, or split and the AllowedIPs
+	lockFile   = runDir + "/lock"    // write-locked (fcntl) by `nordtv up` from its first step to its exit
+	pidFile    = runDir + "/pid"     // written once the tunnel is up
+	serverFile = runDir + "/server"  // what it connected to
+	modeFile   = runDir + "/mode"    // full, or split and the AllowedIPs
+	giveUpFile = runDir + "/giveups" // how many `up` in a row gave up on a server that never answered
 
 	legacyPidFile = "/tmp/nordtv.pid" // nordtv 1.0.0 to 1.1.1, still running after an update
 
 	// Without a handshake for retryAfter, the endpoint is set again (a host name looked up again first); without one
 	// for giveUpAfter, `up` stops so that the next start (the Shard's "Keep connected") connects from scratch.
+	// Both count from the first packet sent without an answer (a stall), not from the last handshake: an idle tunnel
+	// without PersistentKeepalive sends nothing, and is not a dead one. Each `up` that gives up in a row waits twice
+	// as long as the one before (giveUpAfter, then 30, then 60 min at most): every restart drops the kill switch for
+	// a moment, and a server that does not answer must not make that happen every 15 minutes.
 	retryAfter  = 5 * time.Minute
 	giveUpAfter = 15 * time.Minute
+	maxGiveUps  = 2 // 15 << 2 = 60 min
+	// A split tunnel's DNS redirect is only in place while the tunnel answers: it is added at the first sign of life
+	// and removed after a stall this long, so a dead tunnel never takes the whole TV's DNS with it. WireGuard renews
+	// a working session every 2 minutes, and drops it after 3 without an answer.
+	dnsDropAfter = 3 * time.Minute
+	// Until the tunnel has answered (and while it is stalled), keepalives go out every probeKeepalive seconds even
+	// when the .conf turns them off, so a handshake happens without waiting for traffic.
+	probeKeepalive = 25
 
 	soMark = 0x24 // SO_MARK on Linux (named here so the tests also build on other systems)
 )
@@ -622,7 +635,7 @@ func cmdUp(args []string) {
 	if psk != "" {
 		uapi += "preshared_key=" + psk + "\n"
 	}
-	uapi += fmt.Sprintf("endpoint=%s\npersistent_keepalive_interval=%d\nreplace_allowed_ips=true\n", ep.String(), c.Keepalive)
+	uapi += fmt.Sprintf("endpoint=%s\npersistent_keepalive_interval=%d\nreplace_allowed_ips=true\n", ep.String(), probeKA(c.Keepalive))
 	for _, a := range c.Allowed {
 		uapi += "allowed_ip=" + a + "\n"
 	}
@@ -668,13 +681,27 @@ func cmdUp(args []string) {
 
 	// Force all DNS (the router from DHCP and resolvers hardcoded by apps) to the VPN resolver. A split tunnel
 	// does this only when its .conf names a DNS server; otherwise the TV keeps its own. The WireGuard server itself
-	// is let through first, in case it listens on port 53.
+	// is let through first, in case it listens on port 53. A full tunnel redirects at once (everything goes through
+	// it anyway, and DNS must not leak outside); a split tunnel only once the tunnel answers (see dnsDropAfter).
 	dns := c.DNS
 	if len(dns) == 0 && !split {
 		dns = fallbackDNS
 	}
 	redirect := len(dns) > 0
-	if redirect {
+	redirectOn := false
+	setRedirect := func(on bool) {
+		if on == redirectOn {
+			return
+		}
+		redirectOn = on
+		if !on {
+			for range 3 {
+				shq("iptables", "-t", "nat", "-D", "OUTPUT", "-j", natChain)
+			}
+			shq("iptables", "-t", "nat", "-F", natChain)
+			shq("iptables", "-t", "nat", "-X", natChain)
+			return
+		}
 		shq("iptables", "-t", "nat", "-N", natChain)
 		shq("iptables", "-t", "nat", "-A", natChain, "-o", "lo", "-j", "RETURN")
 		shq(epReturn(ep, "iptables", "-t", "nat", "-A", natChain)...)
@@ -682,6 +709,9 @@ func cmdUp(args []string) {
 			shq("iptables", "-t", "nat", "-A", natChain, "-p", p, "--dport", "53", "-j", "DNAT", "--to-destination", dns[0]+":53")
 		}
 		shq("iptables", "-t", "nat", "-I", "OUTPUT", "1", "-j", natChain)
+	}
+	if redirect && !split {
+		setRedirect(true)
 	}
 	shq("ip", "route", "flush", "cache")
 
@@ -715,9 +745,14 @@ func cmdUp(args []string) {
 	mu.Unlock()
 	log.Printf("tunnel %s up", ifName)
 
+	// See health: stalled means something went out and no session has answered it.
+	giveUps := readGiveUps()
+	giveUp := giveUpAfter << giveUps
 	tick := time.NewTicker(30 * time.Second)
-	lastOK := time.Now() // the last handshake, or the start
-	lastTry := lastOK
+	h := newHealth(time.Now())
+	probing := c.Keepalive == 0 // probeKA put keepalives on until the tunnel answers
+	lastTry := time.Now()
+	setKeepalive := func(sec int) { dev.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=%d\n", pub, sec)) }
 	for {
 		select {
 		case s := <-quit:
@@ -732,8 +767,25 @@ func cmdUp(args []string) {
 			removeRunFiles()
 			os.Exit(1)
 		case <-tick.C:
-			if hs := lastHandshake(dev); hs.After(lastOK) {
-				lastOK = hs
+			now := time.Now()
+			wasStalled, first := h.stalled(now), !h.answered
+			if h.observe(peerStats(dev), now) {
+				if first {
+					log.Print("tunnel answering")
+				} else if wasStalled > dnsDropAfter {
+					log.Printf("tunnel answering again after %d min", int(wasStalled/time.Minute))
+				}
+				if giveUps > 0 {
+					giveUps, giveUp = 0, giveUpAfter
+					os.Remove(giveUpFile)
+				}
+				if probing {
+					setKeepalive(c.Keepalive) // back to the .conf's own: none
+					probing = false
+				}
+				if redirect {
+					setRedirect(true)
+				}
 			}
 			// Wi-Fi reconnect / DHCP changes can wipe our rules; re-assert them.
 			if !hasRule() {
@@ -742,17 +794,34 @@ func cmdUp(args []string) {
 					shq(s...)
 				}
 			}
-			if time.Since(lastOK) > giveUpAfter {
+			stalled := h.stalled(now)
+			if stalled == 0 {
+				lastTry = now
+				continue
+			}
+			if split && redirectOn && stalled > dnsDropAfter {
+				log.Printf("no answer for %d min: DNS back to the TV's own servers until the tunnel answers", int(stalled/time.Minute))
+				setRedirect(false)
+			}
+			if !probing && c.Keepalive == 0 {
+				// Something went out unanswered: keep probing, so that the tunnel coming back is seen, and so that a
+				// dead one is found and retried below even if nothing else is sent.
+				setKeepalive(probeKeepalive)
+				probing = true
+			}
+			if stalled > giveUp {
 				// Whatever is wrong (a server gone, a new address the lookup below could not find), a fresh start
 				// fixes it: `up` removes every rule, looks the server up (NordVPN: asks for a new one) and connects.
-				log.Printf("no handshake for %d min, stopping so that the next start connects from scratch", int(giveUpAfter/time.Minute))
+				next := giveUpAfter << min(giveUps+1, maxGiveUps)
+				log.Printf("no answer for %d min, stopping so that the next start connects from scratch (the next one waits %d min)", int(giveUp/time.Minute), int(next/time.Minute))
+				writeGiveUps(giveUps + 1)
 				dev.Close()
 				cleanup(true)
 				removeRunFiles()
 				os.Exit(1)
 			}
-			if time.Since(lastOK) > retryAfter && time.Since(lastTry) > retryAfter {
-				lastTry = time.Now()
+			if stalled > retryAfter && now.Sub(lastTry) > retryAfter {
+				lastTry = now
 				if byName {
 					// A host-name endpoint may have moved (a home server on a dynamic-DNS name): look it up again,
 					// past the tunnel, the DNS redirect and the kill switch (lookupDirect). The kill switch and
@@ -765,13 +834,13 @@ func cmdUp(args []string) {
 						if killswitch {
 							shq(epReturn(nep, "iptables", "-I", chain, "1")...)
 						}
-						if redirect {
+						if redirectOn { // when it is added later, it is made with the new address
 							shq(epReturn(nep, "iptables", "-t", "nat", "-I", natChain, "1")...)
 						}
 						ep = nep
 					}
 				}
-				log.Printf("no handshake for %d min, re-setting endpoint", int(time.Since(lastOK)/time.Minute))
+				log.Printf("no answer for %d min, re-setting endpoint", int(stalled/time.Minute))
 				dev.IpcSet(fmt.Sprintf("public_key=%s\nendpoint=%s\n", pub, ep.String()))
 			}
 		}
@@ -853,21 +922,97 @@ func markSocket(network, address string, rc syscall.RawConn) error {
 	return serr
 }
 
-func lastHandshake(dev *device.Device) time.Time {
+// stats is what the tunnel's one peer reports: its last handshake and the bytes sent.
+type stats struct {
+	handshake time.Time
+	tx        int64
+}
+
+func peerStats(dev *device.Device) stats {
 	s, err := dev.IpcGet()
 	if err != nil {
-		return time.Time{}
+		return stats{}
 	}
-	var sec int64
+	return parseStats(s)
+}
+
+// parseStats reads the UAPI "get" text (key=value lines).
+func parseStats(s string) stats {
+	var st stats
 	for _, l := range strings.Split(s, "\n") {
-		if v, ok := strings.CutPrefix(l, "last_handshake_time_sec="); ok {
-			sec, _ = strconv.ParseInt(v, 10, 64)
+		k, v, _ := strings.Cut(l, "=")
+		n, _ := strconv.ParseInt(v, 10, 64)
+		switch k {
+		case "last_handshake_time_sec":
+			if n > 0 {
+				st.handshake = time.Unix(n, 0)
+			}
+		case "tx_bytes":
+			st.tx = n
 		}
 	}
-	if sec == 0 {
-		return time.Time{}
+	return st
+}
+
+// health follows the tunnel from the peer's stats, read every 30 s. A WireGuard session lives 3 minutes
+// (sessionLife) and is renewed every 2 while packets go out, so a handshake younger than that means the tunnel
+// works. The tunnel is stalled from the first read that finds bytes sent since the last answer and no live
+// session: they went out and nothing answered. An idle tunnel (nothing sent, the .conf without keepalives) is
+// never stalled, however old its last handshake. Before the first handshake it is stalled from the start.
+type health struct {
+	seenHS     time.Time
+	txAt       int64 // tx_bytes when a live session was last seen
+	answered   bool
+	stallStart time.Time
+}
+
+const sessionLife = 3 * time.Minute
+
+func newHealth(start time.Time) *health { return &health{stallStart: start} }
+
+// observe takes one read of the stats; it says whether the tunnel answered (a new handshake) since the last one.
+func (h *health) observe(st stats, now time.Time) bool {
+	fresh := st.handshake.After(h.seenHS)
+	if fresh {
+		h.seenHS, h.answered = st.handshake, true
 	}
-	return time.Unix(sec, 0)
+	if !st.handshake.IsZero() && now.Sub(st.handshake) < sessionLife {
+		h.stallStart, h.txAt = time.Time{}, st.tx
+	} else if h.answered && st.tx > h.txAt && h.stallStart.IsZero() {
+		h.stallStart = now
+	}
+	return fresh
+}
+
+// stalled is for how long the tunnel has been stalled, or 0.
+func (h *health) stalled(now time.Time) time.Duration {
+	if h.stallStart.IsZero() {
+		return 0
+	}
+	return max(now.Sub(h.stallStart), time.Nanosecond)
+}
+
+// probeKA is the keepalive `up` starts with: the .conf's own, or probeKeepalive when the .conf has none, so that
+// the first handshake does not wait for traffic.
+func probeKA(confKA int) int {
+	if confKA == 0 {
+		return probeKeepalive
+	}
+	return confKA
+}
+
+// readGiveUps is how many `up` in a row gave up (0 to maxGiveUps); the next waits giveUpAfter << that.
+func readGiveUps() int {
+	b, err := os.ReadFile(giveUpFile)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return max(0, min(n, maxGiveUps))
+}
+
+func writeGiveUps(n int) {
+	os.WriteFile(giveUpFile, []byte(strconv.Itoa(min(n, maxGiveUps))+"\n"), 0600)
 }
 
 func hasRule() bool {
@@ -1039,6 +1184,7 @@ func cmdDown() {
 	}
 	cleanup(false)
 	removeRunFiles()
+	os.Remove(giveUpFile) // switched off or restarted by hand: the next `up` waits the first time again
 }
 
 // waitDown waits until no `nordtv up` is left (an exited process holds no lock, so a zombie counts as gone).

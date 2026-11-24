@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Keys are 32 bytes of base64; these are made up.
@@ -180,4 +181,64 @@ func TestUpLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
+}
+
+func TestParseStats(t *testing.T) {
+	st := parseStats("private_key=aa\npublic_key=bb\nlast_handshake_time_sec=1795532565\nlast_handshake_time_nsec=12\nrx_bytes=900\ntx_bytes=1480\nerrno=0\n")
+	if st.handshake.Unix() != 1795532565 || st.tx != 1480 {
+		t.Fatalf("got %+v", st)
+	}
+	if st := parseStats("last_handshake_time_sec=0\ntx_bytes=148\n"); !st.handshake.IsZero() || st.tx != 148 {
+		t.Fatalf("no handshake yet: got %+v", st)
+	}
+}
+
+func TestProbeKA(t *testing.T) {
+	if probeKA(0) != probeKeepalive || probeKA(25) != 25 || probeKA(10) != 10 {
+		t.Fatal("probeKA: the .conf's keepalive, or probeKeepalive when it has none")
+	}
+}
+
+// The follow-ups of vetro-plugins#13: an idle tunnel without keepalives is never stalled (no restart every 15 min),
+// a live session never is, and a stall counts from the first unanswered send, not from the last handshake.
+func TestHealth(t *testing.T) {
+	t0 := time.Unix(1795500000, 0)
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	h := newHealth(t0)
+
+	// Before the first handshake: stalled from the start, whatever is sent.
+	h.observe(stats{tx: 148}, at(30))
+	if h.stalled(at(30)) != 30*time.Second {
+		t.Fatalf("not yet answered: stalled %v", h.stalled(at(30)))
+	}
+	// First handshake: answered, not stalled.
+	if !h.observe(stats{handshake: at(40), tx: 400}, at(60)) || h.stalled(at(60)) != 0 {
+		t.Fatal("first handshake: answered and not stalled")
+	}
+	// A passive keepalive inside the live session (sent, nothing back): not a stall.
+	if h.observe(stats{handshake: at(40), tx: 432}, at(90)); h.stalled(at(90)) != 0 {
+		t.Fatal("bytes sent during a live session are not a stall")
+	}
+	// Idle for an hour with keepalives off: nothing sent, the session long gone, still not stalled.
+	for s := 120; s <= 3600; s += 30 {
+		h.observe(stats{handshake: at(40), tx: 432}, at(s))
+	}
+	if h.stalled(at(3600)) != 0 {
+		t.Fatal("an idle tunnel is never stalled")
+	}
+	// Traffic after the idle hour with no answer: stalled from that read, not for an hour.
+	h.observe(stats{handshake: at(40), tx: 600}, at(3630))
+	if d := h.stalled(at(3690)); d != time.Minute {
+		t.Fatalf("stall counts from the first unanswered send: %v", d)
+	}
+	// The server answers again: a new handshake ends the stall.
+	if !h.observe(stats{handshake: at(3700), tx: 900}, at(3720)) || h.stalled(at(3720)) != 0 {
+		t.Fatal("a new handshake ends the stall")
+	}
+	// With keepalives on, a dead server: the session expires while keepalives keep going out.
+	h.observe(stats{handshake: at(3700), tx: 932}, at(3900))
+	h.observe(stats{handshake: at(3700), tx: 964}, at(3930))
+	if d := h.stalled(at(3900 + 15*60)); d != 15*time.Minute { // the session ended at 3880: stalled from the read at 3900
+		t.Fatalf("dead server: stalled %v", d)
+	}
 }

@@ -31,6 +31,7 @@ Dependencies are pinned in `go.mod` and `go.sum`. Compare your `dist/SHA256SUMS`
 | v1.1.0 | `5e1156501e49bcb6077c056cea404b1c6bc7aeba6a923db0be4291c718189866` |
 | v1.1.1 | `d9ce340d9accd43f95f83d7c48e5be5e3ada721c23804a7b5a80e70bf45620b9` (program: `92058145d71583e46393453070a8324b1e85d8ff971ab4e438d2aa5fe9ef8444`) |
 | v1.1.2 | `b56117fb6d34fbb09f9d5acfaab76a256f67de9386f94c6c7fc8e0a32ecc57e4` (program: `df043b5876bd1b078dff04de65fb1fe80606e7c9381555e04ab3b198bc73d255`) |
+| v1.1.3 | `8a14776732998247fe9f9bfcb061c637a257110e5c537ad39eeaab3a0f5a01e6` (program: `d76b31d08b6cc4796f7fb94d462aef374708b6318c91d6b5f9ad717a5bd167f9`) |
 
 Any change to the binary gets a new release and a new hash; the Shard pins one exact hash per version.
 
@@ -47,15 +48,21 @@ Any change to the binary gets a new release and a new hash; the Shard pins one e
   NordVPN, or no `AllowedIPs`): everything goes through the VPN. **Split** (narrower `AllowedIPs`): only those
   addresses do; the rest uses the normal connection.
 - Redirects DNS (port 53) to NordVPN's resolver or the profile's `DNS` (a full-tunnel profile without one: Quad9,
-  9.9.9.9; a split profile without one: no redirect), and blocks IPv6 egress (the tunnel is IPv4).
+  9.9.9.9; a split profile without one: no redirect), and blocks IPv6 egress (the tunnel is IPv4). A split profile's
+  redirect is only there while the tunnel answers: from the first handshake, and not after 3 minutes stalled.
 - **Kill switch, on by default:** while it runs, internet traffic outside the tunnel is rejected. If the VPN drops,
   the TV has no internet until it reconnects; the home network keeps working. `set killswitch off` disables it. Not
   used with a split profile, whose point is to leave the rest outside.
-- **No handshake for 5 minutes:** sets the endpoint again; a host name is looked up again first, past the dead
+- **Stalled** means something was sent and no session (a handshake younger than 3 minutes) answered it; an idle
+  tunnel never is, so `PersistentKeepalive = 0` does not cause restarts. Until the first handshake, and while
+  stalled, keepalives are sent every 25 s even with `PersistentKeepalive = 0`.
+- **Stalled for 5 minutes:** sets the endpoint again; a host name is looked up again first, past the dead
   tunnel: the TV's own DNS servers (`/etc/resolv.conf`), from a socket marked 51820 (so outside the tunnel), with
   the DNS redirect and the kill switch letting through only that socket's port to 53 while it runs (the tested TV's
   kernel has no `iptables` `mark` match). `nordtv lookup HOST:PORT` does the same by hand. **15 minutes:** stops,
-  removing its rules, so that the next start connects from scratch.
+  removing its rules, so that the next start connects from scratch. Each such stop in a row doubles the wait of
+  the next `up` (15, 30, then 60 minutes), since every restart takes the kill switch down for a moment; an answer,
+  or `down`, resets it.
 - **One at a time:** `up` takes a lock (`/dev/shm/nordtv.d/lock`) before anything else, so `down` stops it even
   while it is still connecting, and a second `up` is refused. `start` runs it with `-deadline 40s`: not connected by
   then, it removes what it set up and exits, even if `start` itself was killed.
